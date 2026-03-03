@@ -3532,10 +3532,12 @@ pub async fn delete_video_source(
     Query(params): Query<crate::api::request::DeleteVideoSourceRequest>,
 ) -> Result<ApiResponse<crate::api::response::DeleteVideoSourceResponse>, ApiError> {
     let delete_local_files = params.delete_local_files;
+    let delete_queue_busy = crate::task::DELETE_TASK_QUEUE.is_processing();
+    let has_pending_delete_tasks = crate::task::DELETE_TASK_QUEUE.queue_length().await > 0;
+    let scanning = crate::task::is_scanning();
 
-    // 检查是否正在扫描
-    if crate::task::is_scanning() {
-        // 正在扫描，将删除任务加入队列
+    // 扫描中、删除处理中，或已有待删任务时：统一入队，避免并发删除触发 database is locked。
+    if scanning || delete_queue_busy || has_pending_delete_tasks {
         let task_id = uuid::Uuid::new_v4().to_string();
         let delete_task = crate::task::DeleteVideoSourceTask {
             source_type: source_type.clone(),
@@ -3546,20 +3548,94 @@ pub async fn delete_video_source(
 
         crate::task::enqueue_delete_task(delete_task, &db).await?;
 
-        info!("检测到正在扫描，删除任务已加入队列等待处理: {} ID={}", source_type, id);
+        if scanning {
+            info!("检测到正在扫描，删除任务已加入队列等待处理: {} ID={}", source_type, id);
+        } else {
+            info!(
+                "检测到删除任务正在执行/排队，删除任务已加入队列等待处理: {} ID={}",
+                source_type, id
+            );
+            // 非扫描状态下，确保后台消费队列（避免等待下一轮扫描后才处理）。
+            if !crate::task::DELETE_TASK_QUEUE.is_processing() {
+                let db_clone = db.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = crate::task::process_delete_tasks(db_clone).await {
+                        error!("后台处理删除任务队列失败: {:#}", e);
+                    }
+                });
+            }
+        }
 
         return Ok(ApiResponse::ok(crate::api::response::DeleteVideoSourceResponse {
             success: true,
             source_id: id,
             source_type,
-            message: "正在扫描中，删除任务已加入队列，将在扫描完成后自动处理".to_string(),
+            message: if scanning {
+                "正在扫描中，删除任务已加入队列，将在扫描完成后自动处理".to_string()
+            } else {
+                "删除任务已加入队列，正在按顺序处理".to_string()
+            },
         }));
     }
 
-    // 没有扫描，直接执行删除
-    match delete_video_source_internal(db, source_type, id, delete_local_files).await {
+    // 没有扫描且没有在执行/排队：直接执行删除，并标记“删除处理中”状态。
+    crate::task::DELETE_TASK_QUEUE.set_processing(true);
+    let direct_delete_result =
+        delete_video_source_internal(db.clone(), source_type.clone(), id, delete_local_files).await;
+    crate::task::DELETE_TASK_QUEUE.set_processing(false);
+
+    // 直删期间若有新请求入队，立即后台处理，避免堆积到下一轮扫描。
+    if !crate::task::is_scanning()
+        && crate::task::DELETE_TASK_QUEUE.queue_length().await > 0
+        && !crate::task::DELETE_TASK_QUEUE.is_processing()
+    {
+        let db_clone = db.clone();
+        tokio::spawn(async move {
+            if let Err(e) = crate::task::process_delete_tasks(db_clone).await {
+                error!("后台处理删除任务队列失败: {:#}", e);
+            }
+        });
+    }
+
+    match direct_delete_result {
         Ok(response) => Ok(ApiResponse::ok(response)),
-        Err(e) => Err(e),
+        Err(e) => {
+            // 兜底：若直删遇到数据库锁，回退为入队处理，避免直接报错给前端。
+            let err_text = format!("{:#?}", e);
+            let is_db_locked = err_text.contains("database is locked")
+                || err_text.contains("Database is locked")
+                || err_text.contains("(code: 5)");
+            if is_db_locked {
+                let task_id = uuid::Uuid::new_v4().to_string();
+                let delete_task = crate::task::DeleteVideoSourceTask {
+                    source_type: source_type.clone(),
+                    source_id: id,
+                    delete_local_files,
+                    task_id,
+                };
+                crate::task::enqueue_delete_task(delete_task, &db).await?;
+                info!(
+                    "直删遇到数据库锁，已自动回退为队列处理: {} ID={}",
+                    source_type, id
+                );
+                if !crate::task::DELETE_TASK_QUEUE.is_processing() {
+                    let db_clone = db.clone();
+                    tokio::spawn(async move {
+                        if let Err(err) = crate::task::process_delete_tasks(db_clone).await {
+                            error!("后台处理删除任务队列失败: {:#}", err);
+                        }
+                    });
+                }
+                Ok(ApiResponse::ok(crate::api::response::DeleteVideoSourceResponse {
+                    success: true,
+                    source_id: id,
+                    source_type,
+                    message: "删除任务已加入队列，正在按顺序处理".to_string(),
+                }))
+            } else {
+                Err(e)
+            }
+        }
     }
 }
 
