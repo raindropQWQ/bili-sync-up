@@ -6,6 +6,7 @@
 	import { Input } from '$lib/components/ui/input';
 	import { Label } from '$lib/components/ui/label';
 	import { Switch } from '$lib/components/ui/switch';
+	import * as AlertDialog from '$lib/components/ui/alert-dialog';
 	import { setBreadcrumb } from '$lib/stores/breadcrumb';
 	import { toast } from 'svelte-sonner';
 	import api from '$lib/api';
@@ -135,6 +136,7 @@
 	let submissionAdaptiveMaxHours = '24';
 	let submissionScanConfigLoading = false;
 	let submissionScanConfigSaving = false;
+	let showSubmissionScanConfigDialog = false;
 
 	async function loadSubmissionScanConfig() {
 		const response = await runRequest(() => api.getConfig(), {
@@ -181,6 +183,11 @@
 			toast.error('保存失败', { description: result.data.message });
 		}
 
+		await loadSubmissionScanConfig();
+	}
+
+	async function openSubmissionScanConfigDialog() {
+		showSubmissionScanConfigDialog = true;
 		await loadSubmissionScanConfig();
 	}
 
@@ -756,11 +763,16 @@
 						<CardContent>
 							{#if sourceKey === 'SUBMISSION'}
 								<div class="mb-4 rounded-lg border p-4">
-									<div class="flex flex-col gap-3 md:flex-row md:items-start md:justify-between">
+									<div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
 										<div class="space-y-1">
 											<div class="text-sm font-semibold">投稿源扫描优化</div>
 											<div class="text-muted-foreground text-xs">
-												分批扫描可以降低单轮请求量；自适应会对长期无更新的UP自动降频，减少风控概率。
+												分批扫描可降低单轮请求量；自适应可对长期无更新的UP自动降频，减少风控概率。
+											</div>
+											<div class="text-muted-foreground text-xs">
+												当前：每轮 {submissionScanBatchSize || '0'} 个
+												· 自适应 {submissionAdaptiveScan ? '已开启' : '已关闭'}
+												· 最大间隔 {submissionAdaptiveMaxHours || '24'} 小时
 											</div>
 										</div>
 
@@ -768,56 +780,14 @@
 											<Button
 												size="sm"
 												variant="outline"
-												disabled={submissionScanConfigLoading || submissionScanConfigSaving}
+												disabled={submissionScanConfigSaving}
 												onclick={loadSubmissionScanConfig}
 											>
 												刷新
 											</Button>
-											<Button
-												size="sm"
-												disabled={submissionScanConfigLoading || submissionScanConfigSaving}
-												onclick={saveSubmissionScanConfig}
-											>
-												{submissionScanConfigSaving ? '保存中…' : '保存'}
+											<Button size="sm" disabled={submissionScanConfigSaving} onclick={openSubmissionScanConfigDialog}>
+												弹窗配置
 											</Button>
-										</div>
-									</div>
-
-									<div class="mt-4 grid gap-4 md:grid-cols-3">
-										<div class="space-y-1">
-											<Label>每轮扫描数量</Label>
-											<Input
-												type="number"
-												min="0"
-												step="1"
-												disabled={submissionScanConfigLoading || submissionScanConfigSaving}
-												bind:value={submissionScanBatchSize}
-											/>
-											<div class="text-muted-foreground text-xs">0 表示不限制（保持旧行为），建议 30~80。</div>
-										</div>
-
-										<div class="flex items-center gap-3 md:pt-7">
-											<Switch
-												disabled={submissionScanConfigLoading || submissionScanConfigSaving}
-												bind:checked={submissionAdaptiveScan}
-											/>
-											<div class="space-y-0.5">
-												<Label>自适应扫描频率</Label>
-												<div class="text-muted-foreground text-xs">连续无更新会逐步延长扫描间隔。</div>
-											</div>
-										</div>
-
-										<div class="space-y-1">
-											<Label>最大间隔（小时）</Label>
-											<Input
-												type="number"
-												min="1"
-												max="168"
-												step="1"
-												disabled={!submissionAdaptiveScan || submissionScanConfigLoading || submissionScanConfigSaving}
-												bind:value={submissionAdaptiveMaxHours}
-											/>
-											<div class="text-muted-foreground text-xs">范围 1~168。</div>
 										</div>
 									</div>
 								</div>
@@ -1288,6 +1258,82 @@
 		</div>
 	{/if}
 </div>
+
+<!-- 投稿源扫描优化弹窗 -->
+<AlertDialog.Root bind:open={showSubmissionScanConfigDialog}>
+	<AlertDialog.Content class="max-w-2xl">
+		<AlertDialog.Header>
+			<AlertDialog.Title>投稿源扫描优化</AlertDialog.Title>
+			<AlertDialog.Description>
+				分批扫描可降低单轮请求量；自适应会对长期无更新的UP自动降频，减少风控概率。
+			</AlertDialog.Description>
+		</AlertDialog.Header>
+
+		<div class="mt-3 grid gap-4 md:grid-cols-3">
+			<div class="space-y-1">
+				<Label>每轮扫描数量</Label>
+				<Input
+					type="number"
+					min="0"
+					step="1"
+					disabled={submissionScanConfigLoading || submissionScanConfigSaving}
+					bind:value={submissionScanBatchSize}
+				/>
+				<div class="text-muted-foreground text-xs">0 表示不限制（保持旧行为），建议 30~80。</div>
+			</div>
+
+			<div class="flex items-center gap-3 md:pt-7">
+				<Switch
+					disabled={submissionScanConfigLoading || submissionScanConfigSaving}
+					bind:checked={submissionAdaptiveScan}
+				/>
+				<div class="space-y-0.5">
+					<Label>自适应扫描频率</Label>
+					<div class="text-muted-foreground text-xs">连续无更新会逐步延长扫描间隔。</div>
+				</div>
+			</div>
+
+			<div class="space-y-1">
+				<Label>最大间隔（小时）</Label>
+				<Input
+					type="number"
+					min="1"
+					max="168"
+					step="1"
+					disabled={!submissionAdaptiveScan || submissionScanConfigLoading || submissionScanConfigSaving}
+					bind:value={submissionAdaptiveMaxHours}
+				/>
+				<div class="text-muted-foreground text-xs">范围 1~168。</div>
+			</div>
+		</div>
+
+		<AlertDialog.Footer class="mt-4">
+			<Button
+				size="sm"
+				variant="outline"
+				disabled={submissionScanConfigLoading || submissionScanConfigSaving}
+				onclick={loadSubmissionScanConfig}
+			>
+				刷新
+			</Button>
+			<Button
+				size="sm"
+				variant="outline"
+				disabled={submissionScanConfigSaving}
+				onclick={() => (showSubmissionScanConfigDialog = false)}
+			>
+				关闭
+			</Button>
+			<Button
+				size="sm"
+				disabled={submissionScanConfigLoading || submissionScanConfigSaving}
+				onclick={saveSubmissionScanConfig}
+			>
+				{submissionScanConfigSaving ? '保存中…' : '保存'}
+			</Button>
+		</AlertDialog.Footer>
+	</AlertDialog.Content>
+</AlertDialog.Root>
 
 <!-- 删除确认对话框 -->
 <DeleteVideoSourceDialog
