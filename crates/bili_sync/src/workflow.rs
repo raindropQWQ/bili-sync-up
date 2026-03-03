@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -3166,10 +3167,9 @@ pub async fn download_video_pages(
                 }
             }
         } else if is_submission_collection_video
-            && (crate::config::reload_config().collection_folder_mode.as_ref() == "up_seasonal"
-                || crate::config::reload_config().collection_use_season_structure)
+            && crate::config::reload_config().collection_folder_mode.as_ref() == "up_seasonal"
         {
-            // 投稿源中的UGC合集视频：在“同UP分季”模式下归并到“源路径/UP主名/UP主名合集”根目录
+            // 投稿源中的UGC合集视频：仅在“同UP分季”模式下归并到“源路径/UP主名/UP主名合集”根目录
             let safe_upper_name = crate::utils::filenamify::filenamify(final_video_model.upper_name.trim());
             let up_dir_name = if safe_upper_name.is_empty() {
                 format!("UP_{}", final_video_model.upper_id)
@@ -3269,7 +3269,7 @@ pub async fn download_video_pages(
             && config.collection_folder_mode.as_ref() == "up_seasonal";
         let submission_title_collection_like = is_submission_collection_like_title(&final_video_model.name);
         let submission_collection_use_season = is_submission_collection_video
-            && (config.collection_folder_mode.as_ref() == "up_seasonal" || config.collection_use_season_structure);
+            && config.collection_folder_mode.as_ref() == "up_seasonal";
         let submission_force_season_structure = submission_up_seasonal_mode
             && (!is_single_page || is_submission_collection_video || submission_title_collection_like);
 
@@ -3736,10 +3736,9 @@ pub async fn download_video_pages(
             // 合集：使用带合集信息的NFO生成（第一个视频时）
             let nfo_fixed_root_name = {
                 let cfg = crate::config::reload_config();
-                // 在“同UP分季”或“投稿UGC合集+Season结构”场景下，tvshow 标题固定使用根目录名，
+                // 在“同UP分季”场景下，tvshow 标题固定使用根目录名，
                 // 避免回退成某个官方合集标题（如第一季名）导致媒体库聚合错乱。
-                let lock_to_root_name = cfg.collection_folder_mode.as_ref() == "up_seasonal"
-                    || (is_submission_collection_video && collection_use_season_structure);
+                let lock_to_root_name = cfg.collection_folder_mode.as_ref() == "up_seasonal";
                 if lock_to_root_name {
                     base_path
                         .parent()
@@ -7271,6 +7270,31 @@ pub async fn generate_upper_nfo(
     Ok(ExecutionStatus::Succeeded)
 }
 
+async fn remove_zero_byte_file_if_exists(path: &Path, reason: &str) -> bool {
+    match fs::metadata(path).await {
+        Ok(meta) if meta.is_file() && meta.len() == 0 => {
+            warn!(
+                "检测到0字节文件，准备删除并重试下载: {} ({})",
+                path.display(),
+                reason
+            );
+            match fs::remove_file(path).await {
+                Ok(_) => true,
+                Err(e) => {
+                    warn!("删除0字节文件失败: {} ({})", path.display(), e);
+                    false
+                }
+            }
+        }
+        Ok(_) => false,
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(e) => {
+            debug!("读取文件信息失败（忽略并继续）: {} ({})", path.display(), e);
+            false
+        }
+    }
+}
+
 pub async fn fetch_bangumi_poster(
     should_run: bool,
     video_model: &video::Model,
@@ -7296,6 +7320,9 @@ pub async fn fetch_bangumi_poster(
                 debug!("番剧封面已存在，跳过下载: {:?}", poster_path);
                 return Ok(ExecutionStatus::Succeeded);
             }
+            Ok(meta) if meta.is_file() && meta.len() == 0 => {
+                let _ = remove_zero_byte_file_if_exists(&poster_path, "下载前检查").await;
+            }
             Ok(_) => {}
             Err(e) => debug!("读取番剧封面文件信息失败（继续尝试下载）: {:?} - {}", poster_path, e),
         }
@@ -7311,14 +7338,77 @@ pub async fn fetch_bangumi_poster(
     let poster_url = custom_poster_url.unwrap_or(video_model.cover.as_str());
     let urls = vec![poster_url];
 
-    tokio::select! {
-        biased;
-        _ = token.cancelled() => return Ok(ExecutionStatus::Cancelled),
-        res = downloader.fetch_with_fallback(&urls, &poster_path) => res,
-    }?;
+    let max_attempts = if skip_if_exists { 3 } else { 1 };
+    for attempt in 1..=max_attempts {
+        if skip_if_exists {
+            let _ = remove_zero_byte_file_if_exists(&poster_path, "下载尝试前检查").await;
+        }
 
-    debug!("✓ 成功下载番剧主封面 poster.jpg: {}", poster_url);
-    Ok(ExecutionStatus::Succeeded)
+        let download_result: Result<()> = tokio::select! {
+            biased;
+            _ = token.cancelled() => return Ok(ExecutionStatus::Cancelled),
+            res = downloader.fetch_with_fallback(&urls, &poster_path) => res,
+        };
+
+        match download_result {
+            Ok(_) => {
+                if skip_if_exists {
+                    match fs::metadata(&poster_path).await {
+                        Ok(meta) if meta.is_file() && meta.len() > 0 => {
+                            debug!("✓ 成功下载番剧主封面 poster.jpg: {}", poster_url);
+                            return Ok(ExecutionStatus::Succeeded);
+                        }
+                        Ok(_) => {
+                            warn!(
+                                "封面下载后文件为0字节，将重试: {} (attempt {}/{})",
+                                poster_path.display(),
+                                attempt,
+                                max_attempts
+                            );
+                            let _ = remove_zero_byte_file_if_exists(&poster_path, "下载后校验").await;
+                        }
+                        Err(e) if e.kind() == ErrorKind::NotFound => {
+                            warn!(
+                                "封面下载后文件不存在，将重试: {} (attempt {}/{})",
+                                poster_path.display(),
+                                attempt,
+                                max_attempts
+                            );
+                        }
+                        Err(e) => {
+                            warn!(
+                                "封面下载后读取文件失败，将重试: {} ({}) (attempt {}/{})",
+                                poster_path.display(),
+                                e,
+                                attempt,
+                                max_attempts
+                            );
+                        }
+                    }
+                } else {
+                    debug!("✓ 成功下载番剧主封面 poster.jpg: {}", poster_url);
+                    return Ok(ExecutionStatus::Succeeded);
+                }
+            }
+            Err(e) => {
+                if skip_if_exists {
+                    let _ = remove_zero_byte_file_if_exists(&poster_path, "下载错误后清理").await;
+                }
+                if attempt >= max_attempts {
+                    return Err(e);
+                }
+                warn!(
+                    "封面下载失败，准备重试: {} (attempt {}/{}) - {}",
+                    poster_path.display(),
+                    attempt,
+                    max_attempts,
+                    e
+                );
+            }
+        }
+    }
+
+    Err(anyhow!("封面下载重试耗尽且文件不可用: {}", poster_path.display()))
 }
 
 pub async fn generate_video_nfo(
