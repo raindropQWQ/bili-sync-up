@@ -391,21 +391,105 @@ impl NotificationClient {
             sent_at: chrono::Local::now().to_rfc3339(),
         };
 
-        let mut req = self.client.post(url).header(CONTENT_TYPE, "application/json").json(&payload);
+        let is_open_send = Self::is_open_send_webhook(url);
+        let mut req = self.client.post(url).header(CONTENT_TYPE, "application/json");
 
         if let Some(token) = self.config.webhook_bearer_token.as_ref().filter(|v| !v.trim().is_empty()) {
+            // 兼容部分Webhook网关（如 openSend）使用 apikey 鉴权
+            req = req.header("apikey", token.trim());
             req = req.header(AUTHORIZATION, format!("Bearer {}", token.trim()));
         }
 
-        let resp = req.send().await?;
+        let resp = if is_open_send {
+            // openSend 兼容请求体：仅发送文档要求字段，避免字段校验导致误报
+            req.json(&serde_json::json!({
+                "title": title,
+                "content": content,
+                "imageUrl": serde_json::Value::Null,
+                "proxy": false
+            }))
+            .send()
+            .await?
+        } else {
+            req.json(&payload).send().await?
+        };
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
 
-        if status.is_success() {
+        if status.is_success() || Self::webhook_response_indicates_success(&body) {
+            if !status.is_success() {
+                warn!(
+                    "Webhook返回非2xx但响应体判定为成功，按成功处理: status={}, body={}",
+                    status, body
+                );
+            }
             Ok(())
         } else {
             Err(anyhow!("Webhook返回错误 (status: {}): {}", status, body))
         }
+    }
+
+    fn is_open_send_webhook(url: &str) -> bool {
+        url.to_ascii_lowercase().contains("/api/v1/message/opensend")
+    }
+
+    fn webhook_response_indicates_success(body: &str) -> bool {
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+
+        if trimmed.eq_ignore_ascii_case("ok") || trimmed.eq_ignore_ascii_case("success") {
+            return true;
+        }
+
+        let json: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+
+        if json.get("success").and_then(|v| v.as_bool()) == Some(true)
+            || json.get("ok").and_then(|v| v.as_bool()) == Some(true)
+        {
+            return true;
+        }
+
+        for key in ["code", "errcode", "status", "status_code", "errno"] {
+            if let Some(value) = json.get(key) {
+                match value {
+                    serde_json::Value::Number(n) => {
+                        if n.as_i64() == Some(0) || n.as_i64() == Some(200) {
+                            return true;
+                        }
+                    }
+                    serde_json::Value::String(s) => {
+                        let s_trimmed = s.trim();
+                        if s_trimmed == "0"
+                            || s_trimmed == "200"
+                            || s_trimmed.eq_ignore_ascii_case("ok")
+                            || s_trimmed.eq_ignore_ascii_case("success")
+                        {
+                            return true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if let Some(msg) = json
+            .get("message")
+            .and_then(|v| v.as_str())
+            .or_else(|| json.get("msg").and_then(|v| v.as_str()))
+            .or_else(|| json.get("errmsg").and_then(|v| v.as_str()))
+        {
+            let msg_lower = msg.to_ascii_lowercase();
+            if msg_lower.contains("success") || msg_lower.contains("ok") || msg_lower.contains("成功") {
+                return true;
+            }
+        }
+
+        false
     }
 
     /// 截断 UTF-8 字符串到指定字节长度，并追加提示（保证结果仍是合法 UTF-8）。
