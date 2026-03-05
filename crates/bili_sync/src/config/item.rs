@@ -242,6 +242,9 @@ pub struct SubmissionRiskControlConfig {
     #[serde(default = "default_submission_source_delay_seconds")]
     pub submission_source_delay_seconds: u64,
     /// 是否对动态API启用延迟机制（默认启用）
+    /// 注意：动态API每页仅12个视频，启用延迟会显著延长首次全量扫描时间
+    /// 例如：扫描7年历史约需180次请求，固定6秒延迟需18分钟
+    /// 后续增量扫描不受影响，建议保持启用以避免触发风控
     #[serde(default = "default_enable_dynamic_api_delay")]
     pub enable_dynamic_api_delay: bool,
     /// 动态API的延迟倍数（相对于base_request_delay，默认1.5倍）
