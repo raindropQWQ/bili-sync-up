@@ -5736,6 +5736,21 @@ pub async fn update_submission_selected_videos(
     let current_set: HashSet<String> = current_selected_videos.iter().cloned().collect();
     let mut newly_selected_videos: Vec<String> = incoming_set.difference(&current_set).cloned().collect();
     newly_selected_videos.sort();
+    // 选择集未变化时，仍需兜底恢复“已删除但仍在选择集内”的视频
+    let mut reselected_deleted_videos: Vec<String> = Vec::new();
+    if !selection_changed && !incoming_selected_videos.is_empty() {
+        reselected_deleted_videos = video::Entity::find()
+            .filter(video::Column::SubmissionId.eq(id))
+            .filter(video::Column::Bvid.is_in(incoming_selected_videos.clone()))
+            .filter(video::Column::Deleted.eq(1))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|model| model.bvid)
+            .collect();
+        reselected_deleted_videos.sort();
+        reselected_deleted_videos.dedup();
+    }
 
     // 将选中的视频列表序列化为JSON字符串存储
     let selected_videos_json = if selected_count > 0 {
@@ -5761,9 +5776,14 @@ pub async fn update_submission_selected_videos(
 
     txn.commit().await?;
 
+    let mut backfill_targets = newly_selected_videos.clone();
+    if !selection_changed && !reselected_deleted_videos.is_empty() {
+        backfill_targets = reselected_deleted_videos.clone();
+    }
+
     let mut backfill_stats = None;
     let mut backfill_error = None;
-    if selection_changed && !newly_selected_videos.is_empty() {
+    if !backfill_targets.is_empty() {
         // 回补必须使用“更新后的选择集”，否则新增 BV 可能被旧选择集误过滤
         let mut updated_submission_record = submission_record.clone();
         updated_submission_record.selected_videos = if selected_count > 0 {
@@ -5772,8 +5792,7 @@ pub async fn update_submission_selected_videos(
             None
         };
 
-        match backfill_submission_selected_videos(db.as_ref(), &updated_submission_record, &newly_selected_videos).await
-        {
+        match backfill_submission_selected_videos(db.as_ref(), &updated_submission_record, &backfill_targets).await {
             Ok(stats) => backfill_stats = Some(stats),
             Err(err) => {
                 warn!(
@@ -5799,6 +5818,11 @@ pub async fn update_submission_selected_videos(
 
     if selection_changed {
         message.push_str("；历史选择改为按BV精准回补，不再触发全量扫描");
+    } else if !reselected_deleted_videos.is_empty() {
+        message.push_str(&format!(
+            "；检测到 {} 个已删除且仍选中的视频，已触发精准回补",
+            reselected_deleted_videos.len()
+        ));
     }
 
     if let Some(stats) = backfill_stats {
