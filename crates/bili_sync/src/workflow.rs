@@ -1934,7 +1934,9 @@ pub async fn fetch_video_details(
                                 debug!("视频 {} 没有staff信息", video_model.bvid);
                             }
 
-                            if matches!(video_source, VideoSourceEnum::Submission(_)) {
+                            if matches!(video_source, VideoSourceEnum::Submission(_))
+                                && crate::config::reload_config().collection_folder_mode.as_ref() == "up_seasonal"
+                            {
                                 if let Some(ugc) = ugc_season.as_ref() {
                                     if ugc.mid == Some(video_model_mut.upper_id) {
                                         if let Some(id_value) = ugc.id.as_ref() {
@@ -9178,7 +9180,16 @@ pub async fn generate_page_nfo(
     let nfo = match video_model.single_page {
         Some(single_page) => {
             if single_page {
-                if is_bangumi || video_model.collection_id.is_some() || has_episode_context {
+                // Sub 源单页视频若非 up_seasonal 模式应视为普通单视频（Movie），
+                // 避免 UP主合集聚合打上 season_id 后被误判为合集视频产生 tvshow 结构。
+                let is_sub_standalone = video_model.source_submission_id.is_some()
+                    && video_model.collection_id.is_none();
+                let is_up_seasonal =
+                    crate::config::reload_config().collection_folder_mode.as_ref() == "up_seasonal";
+                if is_bangumi
+                    || video_model.collection_id.is_some()
+                    || (has_episode_context && !(is_sub_standalone && !is_up_seasonal))
+                {
                     // 番剧、合集或已经进入 Season/Episode 命名上下文的单页视频使用 Episode NFO。
                     use crate::utils::nfo::Episode;
                     let mut episode = Episode::from_video_and_page(video_model, page_model);
