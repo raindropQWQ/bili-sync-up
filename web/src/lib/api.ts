@@ -1,6 +1,7 @@
 import type {
 	ApiResponse,
 	VideoSourcesResponse,
+	FilterOption,
 	VideosRequest,
 	VideosResponse,
 	VideoResponse,
@@ -57,6 +58,14 @@ import type {
 } from './types';
 import { ErrorType } from './types';
 import { wsManager } from './ws';
+
+type ResetSpecificTasksOptions =
+	| number[]
+	| {
+			taskIndexes?: number[];
+			videoTaskIndexes?: number[];
+			pageTaskIndexes?: number[];
+	  };
 
 // API 基础配置
 const API_BASE_URL = '/api';
@@ -288,17 +297,24 @@ class ApiClient {
 
 	/**
 	 * 选择性重置特定任务
-	 * @param taskIndexes 要重置的任务索引列表
+	 * @param taskIndexes 要重置的任务索引列表；也可分别传 videoTaskIndexes / pageTaskIndexes
 	 * @param params 可选的查询参数，用于筛选要重置的视频（与 /api/videos 参数保持一致的子集）
 	 * @param force 是否强制重置（包括已完成的任务）
 	 */
 	async resetSpecificTasks(
-		taskIndexes: number[],
+		taskIndexes: ResetSpecificTasksOptions,
 		params?: VideosRequest,
 		force: boolean = false
 	): Promise<ApiResponse<ResetAllVideosResponse>> {
+		const taskPayload = Array.isArray(taskIndexes)
+			? { task_indexes: taskIndexes }
+			: {
+					task_indexes: taskIndexes.taskIndexes ?? [],
+					video_task_indexes: taskIndexes.videoTaskIndexes ?? [],
+					page_task_indexes: taskIndexes.pageTaskIndexes ?? []
+				};
 		const requestBody = {
-			task_indexes: taskIndexes,
+			...taskPayload,
 			force,
 			...params
 		};
@@ -396,8 +412,11 @@ class ApiClient {
 			audio_only_m4a_only?: boolean;
 			flat_folder?: boolean;
 			split_chapters_after_download?: boolean;
+			download_charge_videos?: boolean;
 			download_danmaku?: boolean;
 			download_subtitle?: boolean;
+			download_ai_subtitle?: boolean;
+			ai_subtitle_language?: string;
 			use_dynamic_api?: boolean;
 			collection_aggregate_enabled?: boolean;
 			ai_rename?: boolean;
@@ -407,6 +426,7 @@ class ApiClient {
 			ai_rename_enable_collection?: boolean;
 			ai_rename_enable_bangumi?: boolean;
 			ai_rename_rename_parent_dir?: boolean;
+			filter_option?: FilterOption | null;
 		}
 	): Promise<
 		ApiResponse<{
@@ -417,8 +437,11 @@ class ApiClient {
 			audio_only_m4a_only: boolean;
 			flat_folder: boolean;
 			split_chapters_after_download: boolean;
+			download_charge_videos: boolean;
 			download_danmaku: boolean;
 			download_subtitle: boolean;
+			download_ai_subtitle: boolean;
+			ai_subtitle_language: string;
 			ai_rename: boolean;
 			ai_rename_video_prompt: string;
 			ai_rename_audio_prompt: string;
@@ -429,6 +452,7 @@ class ApiClient {
 			use_dynamic_api: boolean;
 			collection_aggregate_enabled: boolean;
 			collection_aggregate_season_number?: number;
+			filter_option?: FilterOption | null;
 			message: string;
 		}>
 	> {
@@ -440,8 +464,11 @@ class ApiClient {
 			audio_only_m4a_only: boolean;
 			flat_folder: boolean;
 			split_chapters_after_download: boolean;
+			download_charge_videos: boolean;
 			download_danmaku: boolean;
 			download_subtitle: boolean;
+			download_ai_subtitle: boolean;
+			ai_subtitle_language: string;
 			ai_rename: boolean;
 			ai_rename_video_prompt: string;
 			ai_rename_audio_prompt: string;
@@ -452,6 +479,7 @@ class ApiClient {
 			use_dynamic_api: boolean;
 			collection_aggregate_enabled: boolean;
 			collection_aggregate_season_number?: number;
+			filter_option?: FilterOption | null;
 			message: string;
 		}>(`/video-sources/${sourceType}/${id}/download-options`, options);
 	}
@@ -938,6 +966,7 @@ class ApiClient {
 			webhook_custom_headers?: string;
 			webhook_format?: string;
 			webhook_custom_body?: string;
+			webhook_synology_chat_template?: string;
 			notification_min_videos: number;
 			notification_timeout: number;
 			notification_retry_count: number;
@@ -958,6 +987,7 @@ class ApiClient {
 			webhook_custom_headers?: string;
 			webhook_format?: string;
 			webhook_custom_body?: string;
+			webhook_synology_chat_template?: string;
 			notification_min_videos: number;
 			notification_timeout: number;
 			notification_retry_count: number;
@@ -982,6 +1012,7 @@ class ApiClient {
 		webhook_custom_headers?: string;
 		webhook_format?: string;
 		webhook_custom_body?: string;
+			webhook_synology_chat_template?: string;
 		notification_min_videos?: number;
 	}): Promise<ApiResponse<string>> {
 		return this.post<string>('/config/notification', config);
@@ -1005,6 +1036,7 @@ class ApiClient {
 		webhook_custom_headers?: string;
 		webhook_format?: string;
 		webhook_custom_body?: string;
+			webhook_synology_chat_template?: string;
 	}): Promise<
 		ApiResponse<{
 			success: boolean;
@@ -1070,7 +1102,7 @@ export const api = {
 	 * 选择性重置特定任务
 	 */
 	resetSpecificTasks: (
-		taskIndexes: number[],
+		taskIndexes: ResetSpecificTasksOptions,
 		params?: {
 			collection?: number;
 			favorite?: number;
@@ -1204,8 +1236,11 @@ export const api = {
 			audio_only_m4a_only?: boolean;
 			flat_folder?: boolean;
 			split_chapters_after_download?: boolean;
+			download_charge_videos?: boolean;
 			download_danmaku?: boolean;
 			download_subtitle?: boolean;
+			download_ai_subtitle?: boolean;
+			ai_subtitle_language?: string;
 			use_dynamic_api?: boolean;
 			ai_rename?: boolean;
 			ai_rename_video_prompt?: string;
@@ -1214,6 +1249,7 @@ export const api = {
 			ai_rename_enable_collection?: boolean;
 			ai_rename_enable_bangumi?: boolean;
 			ai_rename_rename_parent_dir?: boolean;
+			filter_option?: FilterOption | null;
 		}
 	) => apiClient.updateVideoSourceDownloadOptions(sourceType, id, options),
 
@@ -1414,6 +1450,7 @@ export const api = {
 		webhook_custom_headers?: string;
 		webhook_format?: string;
 		webhook_custom_body?: string;
+			webhook_synology_chat_template?: string;
 		notification_min_videos?: number;
 	}) => apiClient.updateNotificationConfig(config),
 
@@ -1435,6 +1472,7 @@ export const api = {
 		webhook_custom_headers?: string;
 		webhook_format?: string;
 		webhook_custom_body?: string;
+			webhook_synology_chat_template?: string;
 	}) => apiClient.testNotification(params),
 
 	/**

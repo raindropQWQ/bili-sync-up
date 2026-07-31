@@ -2,6 +2,8 @@ use serde::Deserialize;
 use utoipa::IntoParams;
 use utoipa::ToSchema;
 
+use crate::bilibili::FilterOption;
+
 #[derive(Clone, Deserialize, IntoParams, Default)]
 pub struct VideosRequest {
     pub collection: Option<i32>,
@@ -45,6 +47,9 @@ pub struct AddVideoSourceRequest {
     pub collection_type: Option<String>,
     // 是否启用合集聚合（仅当source_type为"collection"时有效）
     pub collection_aggregate_enabled: Option<bool>,
+    /// 视频源级流过滤配置；缺失或 null 表示继承全局配置
+    #[serde(default)]
+    pub filter_option: Option<FilterOption>,
     // 番剧特有字段
     pub media_id: Option<String>,
     pub ep_id: Option<String>,
@@ -68,6 +73,10 @@ pub struct AddVideoSourceRequest {
     pub download_danmaku: Option<bool>,
     // 是否下载字幕文件（SRT）
     pub download_subtitle: Option<bool>,
+    // 是否下载 B 站 AI 字幕
+    pub download_ai_subtitle: Option<bool>,
+    // AI 字幕语言，默认 zh-CN；未命中时回退 zh-CN
+    pub ai_subtitle_language: Option<String>,
     // 是否启用AI重命名
     pub ai_rename: Option<bool>,
     // AI重命名视频提示词（覆盖全局配置）
@@ -88,6 +97,8 @@ pub struct AddVideoSourceRequest {
     pub flat_folder: Option<bool>,
     // 是否在下载后按播放器章节切分为独立视频
     pub split_chapters_after_download: Option<bool>,
+    // 是否下载充电专享视频
+    pub download_charge_videos: Option<bool>,
     // 是否使用动态API获取UP主投稿（仅submission有效）
     pub use_dynamic_api: Option<bool>,
 }
@@ -122,10 +133,16 @@ pub struct UpdateVideoSourceDownloadOptionsRequest {
     pub flat_folder: Option<bool>,
     /// 是否在下载后按播放器章节切分为独立视频
     pub split_chapters_after_download: Option<bool>,
+    /// 是否下载充电专享视频
+    pub download_charge_videos: Option<bool>,
     /// 是否下载弹幕文件（ASS）
     pub download_danmaku: Option<bool>,
     /// 是否下载字幕文件（SRT）
     pub download_subtitle: Option<bool>,
+    /// 是否下载 B 站 AI 字幕
+    pub download_ai_subtitle: Option<bool>,
+    /// AI 字幕语言，默认 zh-CN；未命中时回退 zh-CN
+    pub ai_subtitle_language: Option<String>,
     /// 是否启用AI重命名
     pub ai_rename: Option<bool>,
     /// AI重命名视频提示词（覆盖全局配置）
@@ -144,6 +161,9 @@ pub struct UpdateVideoSourceDownloadOptionsRequest {
     pub use_dynamic_api: Option<bool>,
     /// 是否启用合集聚合（仅collection有效）
     pub collection_aggregate_enabled: Option<bool>,
+    /// 视频源级流过滤配置：字段缺失保持不变，null 表示继承全局，对象表示使用自定义配置
+    #[serde(default)]
+    pub filter_option: Option<Option<FilterOption>>,
 }
 
 // 更新投稿源选中视频列表的请求结构体
@@ -260,6 +280,16 @@ pub struct UpdateConfigRequest {
     pub submission_source_delay_seconds: Option<u64>,
     pub enable_dynamic_api_delay: Option<bool>,
     pub dynamic_api_delay_multiplier: Option<f64>,
+    pub enable_large_source_download_limit: Option<bool>,
+    pub large_source_download_threshold: Option<usize>,
+    pub large_source_download_page_threshold: Option<usize>,
+    pub large_source_max_videos_per_round: Option<usize>,
+    pub large_source_max_pages_per_round: Option<usize>,
+    pub large_source_concurrent_video: Option<usize>,
+    pub large_source_concurrent_page: Option<usize>,
+    pub large_source_playurl_limit: Option<usize>,
+    pub large_source_playurl_duration_ms: Option<u64>,
+    pub audio_only_use_low_qn_for_playurl: Option<bool>,
     // UP主投稿源扫描策略
     pub submission_scan_batch_size: Option<usize>,
     pub submission_adaptive_scan: Option<bool>,
@@ -386,6 +416,7 @@ pub struct UpdateNotificationConfigRequest {
     pub webhook_custom_headers: Option<String>,
     pub webhook_format: Option<String>,
     pub webhook_custom_body: Option<String>,
+    pub webhook_synology_chat_template: Option<String>,
     pub enable_scan_notifications: Option<bool>,
     pub notification_min_videos: Option<usize>,
     pub notification_timeout: Option<u64>,
@@ -410,6 +441,7 @@ pub struct TestNotificationRequest {
     pub webhook_custom_headers: Option<String>,
     pub webhook_format: Option<String>,
     pub webhook_custom_body: Option<String>,
+    pub webhook_synology_chat_template: Option<String>,
 }
 
 // 分页状态更新结构
@@ -431,7 +463,12 @@ pub struct UpdateVideoStatusRequest {
 // 选择性重置任务请求
 #[derive(Deserialize, ToSchema)]
 pub struct ResetSpecificTasksRequest {
+    #[serde(default)]
     pub task_indexes: Vec<usize>, // 要重置的任务索引列表 (0-4)
+    #[serde(default)]
+    pub video_task_indexes: Vec<usize>, // 要重置的 VideoStatus 索引列表 (0-4)
+    #[serde(default)]
+    pub page_task_indexes: Vec<usize>, // 要重置的 PageStatus 索引列表 (0-4)
     pub collection: Option<i32>,
     pub favorite: Option<i32>,
     pub submission: Option<i32>,

@@ -6,6 +6,7 @@
 	import { Label } from '$lib/components/ui/label';
 	import { Textarea } from '$lib/components/ui/textarea';
 	import { Badge } from '$lib/components/ui/badge';
+	import { CustomSelect } from '$lib/components/ui/select';
 	import { SheetFooter } from '$lib/components/ui/sheet';
 	import * as Tabs from '$lib/components/ui/tabs';
 	import QrLogin from '$lib/components/qr-login.svelte';
@@ -189,6 +190,14 @@
 		sourceDelaySeconds: 2,
 		submissionSourceDelaySeconds: 5,
 		dynamicApiDelayMultiplier: 1.5,
+		largeSourceDownloadThreshold: 1000,
+		largeSourceDownloadPageThreshold: 1000,
+		largeSourceMaxVideosPerRound: 0,
+		largeSourceMaxPagesPerRound: 2000,
+		largeSourceConcurrentVideo: 1,
+		largeSourceConcurrentPage: 1,
+		largeSourcePlayurlLimit: 1,
+		largeSourcePlayurlDurationMs: 1000,
 		aria2HealthCheckInterval: 300,
 		riskControlTimeout: 300,
 		autoSolveMaxRetries: 3,
@@ -326,6 +335,16 @@
 	let submissionSourceDelaySeconds = 5;
 	let enableDynamicApiDelay = true;
 	let dynamicApiDelayMultiplier = 1.5;
+	let enableLargeSourceDownloadLimit = true;
+	let largeSourceDownloadThreshold = 1000;
+	let largeSourceDownloadPageThreshold = 1000;
+	let largeSourceMaxVideosPerRound = 0;
+	let largeSourceMaxPagesPerRound = 2000;
+	let largeSourceConcurrentVideo = 1;
+	let largeSourceConcurrentPage = 1;
+	let largeSourcePlayurlLimit = 1;
+	let largeSourcePlayurlDurationMs = 1000;
+	let audioOnlyUseLowQnForPlayurl = true;
 
 	// aria2监控配置
 	let enableAria2HealthCheck = false;
@@ -355,8 +374,9 @@
 	let webhookUrl = '';
 	let webhookBearerToken = '';
 	let webhookCustomHeaders = '';
-	let webhookFormat: 'auto' | 'generic' | 'opensend' | 'custom' = 'auto';
+	let webhookFormat: 'auto' | 'generic' | 'opensend' | 'custom' | 'synology_chat' = 'auto';
 	let webhookCustomBody = '';
+	let webhookSynologyChatTemplate = '';
 	let notificationMinVideos = 1;
 	let notificationSaving = false;
 	let notificationStatus: {
@@ -389,6 +409,9 @@
   "event": "{{event}}",
   "sent_at": "{{sent_at}}"
 }`;
+	const defaultWebhookFormBody = `message={{content_urlencoded}}`;
+	const defaultSynologyChatTemplate = `:loudspeaker: ------{{title}}------ :loudspeaker:
+{{content}}`;
 
 	// 显示帮助信息的状态（在文件命名抽屉中使用）
 	let showHelp = false;
@@ -556,15 +579,6 @@
 		codecs = codecs.filter((_, i) => i !== index);
 	}
 
-	function handleAddCodec(e: Event) {
-		const target = e.target as HTMLSelectElement;
-		const value = target.value;
-		if (value && !codecs.includes(value)) {
-			codecs = [...codecs, value];
-			target.value = '';
-		}
-	}
-
 	onMount(async () => {
 		setBreadcrumb([
 			{ label: '主页', href: '/' },
@@ -682,6 +696,26 @@
 		submissionSourceDelaySeconds = config.submission_source_delay_seconds ?? 5;
 		enableDynamicApiDelay = config.enable_dynamic_api_delay ?? true;
 		dynamicApiDelayMultiplier = config.dynamic_api_delay_multiplier ?? 1.5;
+		enableLargeSourceDownloadLimit = config.enable_large_source_download_limit ?? true;
+		largeSourceDownloadThreshold =
+			config.large_source_download_threshold ?? DEFAULT_CONFIG_VALUES.largeSourceDownloadThreshold;
+		largeSourceDownloadPageThreshold =
+			config.large_source_download_page_threshold ??
+			DEFAULT_CONFIG_VALUES.largeSourceDownloadPageThreshold;
+		largeSourceMaxVideosPerRound =
+			config.large_source_max_videos_per_round ??
+			DEFAULT_CONFIG_VALUES.largeSourceMaxVideosPerRound;
+		largeSourceMaxPagesPerRound =
+			config.large_source_max_pages_per_round ?? DEFAULT_CONFIG_VALUES.largeSourceMaxPagesPerRound;
+		largeSourceConcurrentVideo =
+			config.large_source_concurrent_video ?? DEFAULT_CONFIG_VALUES.largeSourceConcurrentVideo;
+		largeSourceConcurrentPage =
+			config.large_source_concurrent_page ?? DEFAULT_CONFIG_VALUES.largeSourceConcurrentPage;
+		largeSourcePlayurlLimit =
+			config.large_source_playurl_limit ?? DEFAULT_CONFIG_VALUES.largeSourcePlayurlLimit;
+		largeSourcePlayurlDurationMs =
+			config.large_source_playurl_duration_ms ?? DEFAULT_CONFIG_VALUES.largeSourcePlayurlDurationMs;
+		audioOnlyUseLowQnForPlayurl = config.audio_only_use_low_qn_for_playurl ?? true;
 
 		// 风控验证配置
 		riskControlEnabled = config.risk_control?.enabled ?? false;
@@ -1145,6 +1179,40 @@
 				dynamicApiDelayMultiplier,
 				DEFAULT_CONFIG_VALUES.dynamicApiDelayMultiplier
 			),
+			enable_large_source_download_limit: enableLargeSourceDownloadLimit,
+			large_source_download_threshold: normalizeNumberInput(
+				largeSourceDownloadThreshold,
+				DEFAULT_CONFIG_VALUES.largeSourceDownloadThreshold
+			),
+			large_source_download_page_threshold: normalizeNumberInput(
+				largeSourceDownloadPageThreshold,
+				DEFAULT_CONFIG_VALUES.largeSourceDownloadPageThreshold
+			),
+			large_source_max_videos_per_round: normalizeNumberInput(
+				largeSourceMaxVideosPerRound,
+				DEFAULT_CONFIG_VALUES.largeSourceMaxVideosPerRound
+			),
+			large_source_max_pages_per_round: normalizeNumberInput(
+				largeSourceMaxPagesPerRound,
+				DEFAULT_CONFIG_VALUES.largeSourceMaxPagesPerRound
+			),
+			large_source_concurrent_video: normalizeNumberInput(
+				largeSourceConcurrentVideo,
+				DEFAULT_CONFIG_VALUES.largeSourceConcurrentVideo
+			),
+			large_source_concurrent_page: normalizeNumberInput(
+				largeSourceConcurrentPage,
+				DEFAULT_CONFIG_VALUES.largeSourceConcurrentPage
+			),
+			large_source_playurl_limit: normalizeNumberInput(
+				largeSourcePlayurlLimit,
+				DEFAULT_CONFIG_VALUES.largeSourcePlayurlLimit
+			),
+			large_source_playurl_duration_ms: normalizeNumberInput(
+				largeSourcePlayurlDurationMs,
+				DEFAULT_CONFIG_VALUES.largeSourcePlayurlDurationMs
+			),
+			audio_only_use_low_qn_for_playurl: audioOnlyUseLowQnForPlayurl,
 			// aria2监控配置
 			enable_aria2_health_check: enableAria2HealthCheck,
 			enable_aria2_auto_restart: enableAria2AutoRestart,
@@ -1331,6 +1399,7 @@
 			config.webhook_custom_headers = webhookCustomHeaders.trim();
 			config.webhook_format = webhookFormat;
 			config.webhook_custom_body = webhookCustomBody.trim();
+			config.webhook_synology_chat_template = webhookSynologyChatTemplate;
 		}
 
 		const response = await runRequest(() => api.updateNotificationConfig(config), {
@@ -1475,9 +1544,18 @@
 		webhookBearerToken = response.data.webhook_bearer_token || '';
 		webhookCustomHeaders = response.data.webhook_custom_headers || '';
 		webhookFormat =
-			(response.data.webhook_format as 'auto' | 'generic' | 'opensend' | 'custom' | undefined) ||
+			(response.data.webhook_format as
+				| 'auto'
+				| 'generic'
+				| 'opensend'
+				| 'custom'
+				| 'synology_chat'
+				| undefined) ||
 			'auto';
 		webhookCustomBody = response.data.webhook_custom_body || '';
+		webhookSynologyChatTemplate =
+			response.data.webhook_synology_chat_template ||
+			(webhookFormat === 'synology_chat' ? defaultSynologyChatTemplate : '');
 	}
 
 	// 测试推送通知
@@ -1506,6 +1584,7 @@
 			request.webhook_custom_headers = webhookCustomHeaders.trim();
 			request.webhook_format = webhookFormat;
 			request.webhook_custom_body = webhookCustomBody.trim();
+			request.webhook_synology_chat_template = webhookSynologyChatTemplate;
 		}
 
 		const response = await runRequest(() => api.testNotification(request), {
@@ -1914,15 +1993,17 @@
 			<div class="grid grid-cols-1 gap-4 {isMobile ? 'sm:grid-cols-1' : 'md:grid-cols-2'}">
 				<div class="space-y-2">
 					<Label for="collection-folder-mode">合集/投稿目录模式</Label>
-					<select
+					<CustomSelect
 						id="collection-folder-mode"
-						bind:value={collectionFolderMode}
+						value={collectionFolderMode}
+						options={[
+							{ value: 'separate', label: '分离模式' },
+							{ value: 'unified', label: '统一模式' },
+							{ value: 'up_seasonal', label: '投稿源同UP分季（仅投稿源）' }
+						]}
+						onChange={(nextValue) => (collectionFolderMode = String(nextValue ?? 'unified'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						<option value="separate">分离模式</option>
-						<option value="unified" selected>统一模式</option>
-						<option value="up_seasonal">投稿源同UP分季（仅投稿源）</option>
-					</select>
+					/>
 					<p class="text-muted-foreground text-sm">
 						分离模式：每个视频独立文件夹<br />
 						统一模式：所有视频在合集文件夹下<br />
@@ -1959,15 +2040,13 @@
 
 			<div class="space-y-2">
 				<Label for="nfo-time-type">NFO文件时间类型</Label>
-				<select
+				<CustomSelect
 					id="nfo-time-type"
-					bind:value={nfoTimeType}
+					value={nfoTimeType}
+					options={nfoTimeTypeOptions}
+					onChange={(nextValue) => (nfoTimeType = String(nextValue ?? 'favtime'))}
 					class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-				>
-					{#each nfoTimeTypeOptions as option (option.value)}
-						<option value={option.value}>{option.label}</option>
-					{/each}
-				</select>
+				/>
 				<p class="text-muted-foreground text-sm">
 					选择NFO文件中使用的时间类型。
 					<span class="font-medium text-amber-600">注意：</span>
@@ -2057,54 +2136,46 @@
 			<div class="grid grid-cols-1 gap-4 {isMobile ? 'sm:grid-cols-1' : 'md:grid-cols-2'}">
 				<div class="space-y-2">
 					<Label for="video-max-quality">视频最高质量</Label>
-					<select
+					<CustomSelect
 						id="video-max-quality"
-						bind:value={videoMaxQuality}
+						value={videoMaxQuality}
+						options={videoQualityOptions}
+						onChange={(nextValue) => (videoMaxQuality = String(nextValue ?? 'Quality8k'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						{#each videoQualityOptions as option (option.value)}
-							<option value={option.value}>{option.label}</option>
-						{/each}
-					</select>
+					/>
 				</div>
 
 				<div class="space-y-2">
 					<Label for="video-min-quality">视频最低质量</Label>
-					<select
+					<CustomSelect
 						id="video-min-quality"
-						bind:value={videoMinQuality}
+						value={videoMinQuality}
+						options={videoQualityOptions}
+						onChange={(nextValue) => (videoMinQuality = String(nextValue ?? 'Quality360p'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						{#each videoQualityOptions as option (option.value)}
-							<option value={option.value}>{option.label}</option>
-						{/each}
-					</select>
+					/>
 				</div>
 
 				<div class="space-y-2">
 					<Label for="audio-max-quality">音频最高质量</Label>
-					<select
+					<CustomSelect
 						id="audio-max-quality"
-						bind:value={audioMaxQuality}
+						value={audioMaxQuality}
+						options={audioQualityOptions}
+						onChange={(nextValue) => (audioMaxQuality = String(nextValue ?? 'QualityHiRES'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						{#each audioQualityOptions as option (option.value)}
-							<option value={option.value}>{option.label}</option>
-						{/each}
-					</select>
+					/>
 				</div>
 
 				<div class="space-y-2">
 					<Label for="audio-min-quality">音频最低质量</Label>
-					<select
+					<CustomSelect
 						id="audio-min-quality"
-						bind:value={audioMinQuality}
+						value={audioMinQuality}
+						options={audioQualityOptions}
+						onChange={(nextValue) => (audioMinQuality = String(nextValue ?? 'Quality64k'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						{#each audioQualityOptions as option (option.value)}
-							<option value={option.value}>{option.label}</option>
-						{/each}
-					</select>
+					/>
 				</div>
 			</div>
 
@@ -2182,18 +2253,21 @@
 
 					{#if codecs.length < codecOptions.length}
 						<div class="mt-2">
-							<select
+							<CustomSelect
 								class="w-full rounded-md border p-2 text-sm"
-								onchange={handleAddCodec}
-								value=""
-							>
-								<option value="" disabled>添加编解码器...</option>
-								{#each codecOptions as option (option.value)}
-									{#if !codecs.includes(option.value)}
-										<option value={option.value}>{option.label}</option>
-									{/if}
-								{/each}
-							</select>
+								value={null}
+								options={codecOptions
+									.filter((option) => !codecs.includes(option.value))
+									.map((option) => ({ value: option.value, label: option.label }))}
+								placeholder="添加编解码器..."
+								clearAfterSelect
+								onChange={(nextValue) => {
+									const codec = String(nextValue ?? '');
+									if (codec && !codecs.includes(codec)) {
+										codecs = [...codecs, codec];
+									}
+								}}
+							/>
 						</div>
 					{/if}
 				</div>
@@ -3309,6 +3383,159 @@
 				</div>
 			</div>
 
+			<!-- 大源下载限制配置 -->
+			<div
+				class="rounded-lg border border-red-200 bg-red-50 p-4 dark:border-red-800 dark:bg-red-950/20"
+			>
+				<h3 class="mb-3 text-sm font-medium text-red-800 dark:text-red-200">🧯 大源下载限制配置</h3>
+				<div class="space-y-4">
+					<div class="flex items-center space-x-2">
+						<input
+							type="checkbox"
+							id="enable-large-source-download-limit"
+							bind:checked={enableLargeSourceDownloadLimit}
+							class="text-primary focus:ring-primary h-4 w-4 rounded border-gray-300"
+						/>
+						<Label for="enable-large-source-download-limit" class="text-sm">启用大源下载保护</Label>
+						<p class="text-muted-foreground ml-2 text-xs">
+							针对视频数或分P数较大的投稿源限制下载并发、每轮下载数量和 playurl 请求频率
+						</p>
+					</div>
+
+					{#if enableLargeSourceDownloadLimit}
+						<div class="grid grid-cols-1 gap-4 {isMobile ? 'sm:grid-cols-1' : 'md:grid-cols-2'}">
+							<div class="space-y-2">
+								<Label for="large-source-download-threshold">大源判定阈值（视频数）</Label>
+								<Input
+									id="large-source-download-threshold"
+									type="number"
+									bind:value={largeSourceDownloadThreshold}
+									min="1"
+									max="100000"
+									placeholder="1000"
+								/>
+								<p class="text-muted-foreground text-xs">源内视频数超过该值时启用下载阶段保护</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-download-page-threshold">大源判定阈值（分P数）</Label>
+								<Input
+									id="large-source-download-page-threshold"
+									type="number"
+									bind:value={largeSourceDownloadPageThreshold}
+									min="0"
+									max="100000"
+									placeholder="1000"
+								/>
+								<p class="text-muted-foreground text-xs">
+									源内已识别分P数或本轮待处理分P数超过该值时启用下载阶段保护；0 表示关闭分P阈值判定
+								</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-max-videos-per-round">每轮最多下载视频数</Label>
+								<Input
+									id="large-source-max-videos-per-round"
+									type="number"
+									bind:value={largeSourceMaxVideosPerRound}
+									min="0"
+									max="10000"
+									placeholder="0"
+								/>
+								<p class="text-muted-foreground text-xs">0 表示不限制；未下载的视频下轮继续处理</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-max-pages-per-round">每轮最多下载分页数</Label>
+								<Input
+									id="large-source-max-pages-per-round"
+									type="number"
+									bind:value={largeSourceMaxPagesPerRound}
+									min="0"
+									max="100000"
+									placeholder="2000"
+								/>
+								<p class="text-muted-foreground text-xs">按整视频截断，避免半个多P视频被误标完成</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-concurrent-video">下载视频并发</Label>
+								<Input
+									id="large-source-concurrent-video"
+									type="number"
+									bind:value={largeSourceConcurrentVideo}
+									min="1"
+									max="32"
+									placeholder="1"
+								/>
+								<p class="text-muted-foreground text-xs">
+									大源下载阶段建议保持 1，降低连续取流压力
+								</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-concurrent-page">单视频分页并发</Label>
+								<Input
+									id="large-source-concurrent-page"
+									type="number"
+									bind:value={largeSourceConcurrentPage}
+									min="1"
+									max="32"
+									placeholder="1"
+								/>
+								<p class="text-muted-foreground text-xs">控制同一视频多P分页并发下载数量</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-playurl-limit">playurl 请求数</Label>
+								<Input
+									id="large-source-playurl-limit"
+									type="number"
+									bind:value={largeSourcePlayurlLimit}
+									min="1"
+									max="100"
+									placeholder="1"
+								/>
+								<p class="text-muted-foreground text-xs">每个限制窗口内允许的取流请求数</p>
+							</div>
+
+							<div class="space-y-2">
+								<Label for="large-source-playurl-duration-ms">playurl 限制窗口（毫秒）</Label>
+								<Input
+									id="large-source-playurl-duration-ms"
+									type="number"
+									bind:value={largeSourcePlayurlDurationMs}
+									min="1"
+									max="60000"
+									placeholder="1000"
+								/>
+								<p class="text-muted-foreground text-xs">默认 1000 毫秒，即每秒最多 1 次取流请求</p>
+							</div>
+
+							<div class="flex items-center space-x-2">
+								<input
+									type="checkbox"
+									id="audio-only-use-low-qn-for-playurl"
+									bind:checked={audioOnlyUseLowQnForPlayurl}
+									class="text-primary focus:ring-primary h-4 w-4 rounded border-gray-300"
+								/>
+								<Label for="audio-only-use-low-qn-for-playurl" class="text-sm"
+									>仅音频下载使用低清晰度取流</Label
+								>
+							</div>
+						</div>
+
+						<div class="rounded-lg bg-red-100 p-3 dark:bg-red-900/20">
+							<p class="text-sm text-red-700 dark:text-red-300">
+								<strong>说明：</strong
+								>大源保护只限制下载阶段；视频数或分P数超过阈值都会触发。已下载成功的视频会正常更新状态，未进入本轮预算的视频不会误写断点，下次扫描会继续从未完成部分处理。
+								默认 playurl 限速为 1 次/秒。
+							</p>
+						</div>
+					{/if}
+				</div>
+			</div>
+
 			<!-- 使用建议 -->
 			<div
 				class="rounded-lg border border-gray-200 bg-gray-50 p-4 dark:border-gray-700 dark:bg-gray-900/50"
@@ -3821,17 +4048,22 @@
 
 				<div class="space-y-2">
 					<Label for="notification-channel">选择推送渠道</Label>
-					<select
+					<CustomSelect
 						id="notification-channel"
-						bind:value={activeNotificationChannel}
+						value={activeNotificationChannel}
+						options={[
+							{ value: 'none', label: '无' },
+							{ value: 'serverchan', label: 'Server酱' },
+							{ value: 'serverchan3', label: 'Server酱3' },
+							{ value: 'wecom', label: '企业微信群机器人' },
+							{ value: 'webhook', label: 'Webhook' }
+						]}
+						onChange={(nextValue) =>
+							(activeNotificationChannel = String(
+								nextValue ?? 'none'
+							) as typeof activeNotificationChannel)}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						<option value="none">无</option>
-						<option value="serverchan">Server酱</option>
-						<option value="serverchan3">Server酱3</option>
-						<option value="wecom">企业微信群机器人</option>
-						<option value="webhook">Webhook</option>
-					</select>
+					/>
 					<p class="text-muted-foreground text-sm">选择一个推送渠道，所有推送将发送到该渠道</p>
 				</div>
 			</div>
@@ -3873,19 +4105,24 @@
 
 					<div class="space-y-2">
 						<Label for="generic-webhook-format">Webhook格式</Label>
-						<select
+						<CustomSelect
 							id="generic-webhook-format"
-							bind:value={webhookFormat}
+							value={webhookFormat}
+							options={[
+								{ value: 'auto', label: '自动识别（推荐）' },
+								{ value: 'generic', label: '通用 JSON' },
+								{ value: 'opensend', label: 'openSend' },
+								{ value: 'custom', label: '自定义请求' },
+								{ value: 'synology_chat', label: 'Synology Chat（群晖）' }
+							]}
+							onChange={(nextValue) =>
+								(webhookFormat = String(nextValue ?? 'auto') as typeof webhookFormat)}
 							class="bg-background border-input ring-offset-background placeholder:text-muted-foreground focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-						>
-							<option value="auto">自动识别（推荐）</option>
-							<option value="generic">通用 JSON</option>
-							<option value="opensend">openSend</option>
-							<option value="custom">自定义 JSON</option>
-						</select>
+						/>
 						<p class="text-muted-foreground text-sm">
-							自动识别会根据URL判断；openSend 会发送其专用字段并附带 apikey 头；自定义 JSON
-							可自行定义 POST Body 结构
+							自动识别、openSend 与 Synology Chat 均为预设模板；自定义请求可发送任意 POST Body，
+							不限制消息类型。Synology Chat 会按群晖要求发送 <code>payload=</code>
+							表单。
 						</p>
 					</div>
 
@@ -3898,7 +4135,9 @@
 							placeholder="https://example.com/notify/webhook"
 						/>
 						<p class="text-muted-foreground text-sm">
-							将发送JSON POST请求到该地址，支持按响应内容判定成功
+							{webhookFormat === 'synology_chat'
+								? '将以 application/x-www-form-urlencoded 发送 payload=JSON，适用于 Synology Chat Incoming Webhook'
+								: '将发送 JSON POST 请求到该地址，支持按响应内容判定成功'}
 						</p>
 					</div>
 
@@ -3939,17 +4178,30 @@
 					{#if webhookFormat === 'custom'}
 						<div class="space-y-2">
 							<div class="flex items-center justify-between gap-3">
-								<Label for="generic-webhook-custom-body">自定义 POST Body</Label>
-								<Button
-									type="button"
-									variant="outline"
-									size="sm"
-									onclick={() => {
-										webhookCustomBody = defaultWebhookCustomBody;
-									}}
-								>
-									填入示例
-								</Button>
+								<Label for="generic-webhook-custom-body">自定义 POST Body（任意文本）</Label>
+								<div class="flex gap-2">
+									<Button
+										type="button"
+										variant="outline"
+										size="sm"
+										onclick={() => {
+											webhookCustomBody = defaultWebhookCustomBody;
+										}}
+									>
+										JSON 模板
+									</Button>
+									<Button
+										type="button"
+										variant="outline"
+										size="sm"
+										onclick={() => {
+											webhookCustomBody = defaultWebhookFormBody;
+											webhookCustomHeaders = '{"Content-Type":"application/x-www-form-urlencoded"}';
+										}}
+									>
+										表单模板
+									</Button>
+								</div>
 							</div>
 							<Textarea
 								id="generic-webhook-custom-body"
@@ -3968,10 +4220,38 @@
 								<p>&#123;&#123;channel&#125;&#125;：当前通知渠道名称，例如 webhook</p>
 								<p>&#123;&#123;event&#125;&#125;：事件类型，例如 test_notification</p>
 								<p>&#123;&#123;sent_at&#125;&#125;：发送时间</p>
-								<p>
-									请直接填写有效
-									JSON。若某个值只写占位符，发送时会按原始类型写入；若嵌在字符串中，则会按文本替换。
-								</p>
+								<p>可填写 JSON、<code>application/x-www-form-urlencoded</code> 或任意原始文本；不会限制消息类型。</p>
+								<p>JSON 模板继续兼容原有安全替换；其他格式按原文本替换占位符。原始模板还支持 <code>&#123;&#123;title_json&#125;&#125;</code> 和 <code>&#123;&#123;title_urlencoded&#125;&#125;</code>（其他字段同理）。</p>
+							</div>
+						</div>
+					{/if}
+
+					{#if webhookFormat === 'synology_chat'}
+						<div class="space-y-2">
+							<div class="flex items-center justify-between gap-3">
+								<Label for="synology-chat-template">群晖 Chat 消息模板</Label>
+								<Button
+									type="button"
+									variant="outline"
+									size="sm"
+									onclick={() => {
+										webhookSynologyChatTemplate = defaultSynologyChatTemplate;
+									}}
+								>
+									填入模板
+								</Button>
+							</div>
+							<Textarea
+								id="synology-chat-template"
+								bind:value={webhookSynologyChatTemplate}
+								rows={8}
+								placeholder={defaultSynologyChatTemplate}
+								class="font-mono text-xs"
+							/>
+							<div class="text-muted-foreground space-y-1 text-sm">
+								<p>这是纯文本模板，不会按 Markdown 解析；可直接使用群晖表情短码，例如 <code>:loudspeaker:</code>、<code>:mailbox_closed:</code>。</p>
+								<p>支持占位符：&#123;&#123;title&#125;&#125;、&#123;&#123;content&#125;&#125;、&#123;&#123;source&#125;&#125;、&#123;&#123;channel&#125;&#125;、&#123;&#123;event&#125;&#125;、&#123;&#123;sent_at&#125;&#125;；&#123;&#123;content&#125;&#125; 会自动移除 Markdown 标记。</p>
+								<p>留空时使用默认模板：<code>:loudspeaker: ------&#123;&#123;title&#125;&#125;------ :loudspeaker:</code> 后换行显示正文。</p>
 							</div>
 						</div>
 					{/if}
@@ -4039,14 +4319,16 @@
 
 					<div class="space-y-2">
 						<Label for="wecom-msgtype">消息格式</Label>
-						<select
+						<CustomSelect
 							id="wecom-msgtype"
-							bind:value={wecomMsgtype}
+							value={wecomMsgtype}
+							options={[
+								{ value: 'markdown', label: 'Markdown格式（推荐）' },
+								{ value: 'text', label: '纯文本格式' }
+							]}
+							onChange={(nextValue) => (wecomMsgtype = String(nextValue ?? 'markdown'))}
 							class="border-input bg-background ring-offset-background placeholder:text-muted-foreground focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm file:border-0 file:bg-transparent file:text-sm file:font-medium focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none disabled:cursor-not-allowed disabled:opacity-50"
-						>
-							<option value="markdown">Markdown格式（推荐）</option>
-							<option value="text">纯文本格式</option>
-						</select>
+						/>
 						<p class="text-muted-foreground text-sm">Markdown格式支持富文本显示，纯文本更简洁</p>
 					</div>
 
@@ -4262,15 +4544,17 @@
 
 				<div class="space-y-2">
 					<Label for="risk-control-mode">验证模式</Label>
-					<select
+					<CustomSelect
 						id="risk-control-mode"
-						bind:value={riskControlMode}
+						value={riskControlMode}
+						options={[
+							{ value: 'manual', label: 'manual - 手动验证' },
+							{ value: 'auto', label: 'auto - 自动验证' },
+							{ value: 'skip', label: 'skip - 跳过验证' }
+						]}
+						onChange={(nextValue) => (riskControlMode = String(nextValue ?? 'manual'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						<option value="manual">manual - 手动验证</option>
-						<option value="auto">auto - 自动验证</option>
-						<option value="skip">skip - 跳过验证</option>
-					</select>
+					/>
 					<p class="text-muted-foreground text-xs">
 						manual: 弹出验证页面进行手动验证；auto: 使用第三方服务自动解决验证码；skip:
 						直接跳过风控验证
@@ -4299,14 +4583,16 @@
 
 						<div class="space-y-2">
 							<Label for="auto-solve-service">验证码服务</Label>
-							<select
+							<CustomSelect
 								id="auto-solve-service"
-								bind:value={autoSolveService}
+								value={autoSolveService}
+								options={[
+									{ value: '2captcha', label: '2Captcha' },
+									{ value: 'anticaptcha', label: 'AntiCaptcha' }
+								]}
+								onChange={(nextValue) => (autoSolveService = String(nextValue ?? '2captcha'))}
 								class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-							>
-								<option value="2captcha">2Captcha</option>
-								<option value="anticaptcha">AntiCaptcha</option>
-							</select>
+							/>
 							<p class="text-muted-foreground text-xs">选择验证码识别服务提供商</p>
 						</div>
 
@@ -4464,16 +4750,18 @@
 				<!-- API提供商 -->
 				<div class="space-y-2">
 					<Label for="ai-rename-provider">API提供商</Label>
-					<select
+					<CustomSelect
 						id="ai-rename-provider"
-						bind:value={aiRenameProvider}
+						value={aiRenameProvider}
+						options={[
+							{ value: 'deepseek', label: 'DeepSeek (付费API)' },
+							{ value: 'deepseek-web', label: 'DeepSeek Web (免费)' },
+							{ value: 'openai', label: 'OpenAI' },
+							{ value: 'custom', label: '自定义 (OpenAI兼容)' }
+						]}
+						onChange={(nextValue) => (aiRenameProvider = String(nextValue ?? 'deepseek'))}
 						class="border-input bg-background ring-offset-background focus-visible:ring-ring flex h-10 w-full rounded-md border px-3 py-2 text-sm focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:outline-none"
-					>
-						<option value="deepseek">DeepSeek (付费API)</option>
-						<option value="deepseek-web">DeepSeek Web (免费)</option>
-						<option value="openai">OpenAI</option>
-						<option value="custom">自定义 (OpenAI兼容)</option>
-					</select>
+					/>
 					<p class="text-muted-foreground text-xs">
 						{#if aiRenameProvider === 'deepseek-web'}
 							使用 chat.deepseek.com 免费 Web API，需要从浏览器获取 Token

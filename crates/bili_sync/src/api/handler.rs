@@ -8,7 +8,7 @@ use anyhow::{anyhow, Context, Result};
 use axum::extract::{Extension, Json, Path, Query};
 use axum::http::{header::IF_NONE_MATCH, HeaderMap};
 use axum::response::sse::{Event, KeepAlive, Sse};
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, TimeZone, Utc};
 use html_escape::decode_html_entities;
 
 use crate::http::headers::{create_api_headers, create_image_headers};
@@ -48,6 +48,7 @@ use crate::api::response::{
     VideoSourcesResponse, VideosResponse,
 };
 use crate::api::wrapper::{ApiError, ApiResponse};
+use crate::bilibili::{FilterOption, DEFAULT_AI_SUBTITLE_LANGUAGE};
 use crate::utils::live_updates::{
     notify_video_sources_changed, notify_videos_changed, subscribe_queue_status_changed,
     subscribe_video_sources_changed, subscribe_videos_changed,
@@ -58,6 +59,45 @@ use crate::utils::status::{
 };
 
 const PAGE_STATUS_VIDEO_INDEX: usize = 1;
+
+fn normalize_ai_subtitle_language(language: &str) -> String {
+    let language = language.trim();
+    if language.is_empty() {
+        DEFAULT_AI_SUBTITLE_LANGUAGE.to_string()
+    } else {
+        language.to_string()
+    }
+}
+
+fn ai_subtitle_language_from_request(language: &Option<String>, fallback: &str) -> String {
+    language
+        .as_deref()
+        .map(normalize_ai_subtitle_language)
+        .unwrap_or_else(|| normalize_ai_subtitle_language(fallback))
+}
+
+fn resolve_source_filter_option_update(
+    current: Option<serde_json::Value>,
+    requested: &Option<Option<FilterOption>>,
+) -> Result<Option<serde_json::Value>, ApiError> {
+    match requested {
+        Some(Some(filter_option)) => Ok(Some(serde_json::to_value(filter_option)?)),
+        Some(None) => Ok(None),
+        None => Ok(current),
+    }
+}
+
+fn source_filter_option_to_response(value: Option<serde_json::Value>) -> Result<Option<FilterOption>, ApiError> {
+    value.map(serde_json::from_value).transpose().map_err(ApiError::from)
+}
+
+fn source_filter_option_to_json(value: &Option<FilterOption>) -> Result<Option<serde_json::Value>, ApiError> {
+    value
+        .as_ref()
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(ApiError::from)
+}
 
 // 全局静态的扫码登录服务实例
 use once_cell::sync::Lazy;
@@ -77,6 +117,168 @@ type VideoListRow = (
     Option<String>,
     Option<i32>,
 );
+
+#[derive(Debug, Clone, Copy, Default)]
+struct SourceChargeVisibilityFilters {
+    collection: Option<i32>,
+    favorite: Option<i32>,
+    submission: Option<i32>,
+    watch_later: Option<i32>,
+    bangumi: Option<i32>,
+}
+
+impl From<&VideosRequest> for SourceChargeVisibilityFilters {
+    fn from(params: &VideosRequest) -> Self {
+        Self {
+            collection: params.collection,
+            favorite: params.favorite,
+            submission: params.submission,
+            watch_later: params.watch_later,
+            bangumi: params.bangumi,
+        }
+    }
+}
+
+impl From<&ResetSpecificTasksRequest> for SourceChargeVisibilityFilters {
+    fn from(params: &ResetSpecificTasksRequest) -> Self {
+        Self {
+            collection: params.collection,
+            favorite: params.favorite,
+            submission: params.submission,
+            watch_later: params.watch_later,
+            bangumi: params.bangumi,
+        }
+    }
+}
+
+impl SourceChargeVisibilityFilters {
+    fn has_any(self) -> bool {
+        self.collection.is_some()
+            || self.favorite.is_some()
+            || self.submission.is_some()
+            || self.watch_later.is_some()
+            || self.bangumi.is_some()
+    }
+}
+
+async fn source_download_charge_videos_enabled(
+    db: &DatabaseConnection,
+    source_type: &str,
+    source_id: i32,
+) -> Result<bool, ApiError> {
+    let enabled = match source_type {
+        "collection" => {
+            collection::Entity::find_by_id(source_id)
+                .select_only()
+                .column(collection::Column::DownloadChargeVideos)
+                .into_tuple::<bool>()
+                .one(db)
+                .await?
+        }
+        "favorite" => {
+            favorite::Entity::find_by_id(source_id)
+                .select_only()
+                .column(favorite::Column::DownloadChargeVideos)
+                .into_tuple::<bool>()
+                .one(db)
+                .await?
+        }
+        "submission" => {
+            submission::Entity::find_by_id(source_id)
+                .select_only()
+                .column(submission::Column::DownloadChargeVideos)
+                .into_tuple::<bool>()
+                .one(db)
+                .await?
+        }
+        "watch_later" => {
+            watch_later::Entity::find_by_id(source_id)
+                .select_only()
+                .column(watch_later::Column::DownloadChargeVideos)
+                .into_tuple::<bool>()
+                .one(db)
+                .await?
+        }
+        "bangumi" => {
+            video_source::Entity::find_by_id(source_id)
+                .select_only()
+                .column(video_source::Column::DownloadChargeVideos)
+                .into_tuple::<bool>()
+                .one(db)
+                .await?
+        }
+        _ => None,
+    };
+
+    Ok(enabled.unwrap_or(true))
+}
+
+async fn should_hide_charge_videos_for_source_filters(
+    db: &DatabaseConnection,
+    filters: SourceChargeVisibilityFilters,
+) -> Result<bool, ApiError> {
+    if let Some(id) = filters.bangumi {
+        return Ok(!source_download_charge_videos_enabled(db, "bangumi", id).await?);
+    }
+
+    for (source_type, id) in [
+        ("collection", filters.collection),
+        ("favorite", filters.favorite),
+        ("submission", filters.submission),
+        ("watch_later", filters.watch_later),
+    ] {
+        if let Some(id) = id {
+            if !source_download_charge_videos_enabled(db, source_type, id).await? {
+                return Ok(true);
+            }
+        }
+    }
+
+    Ok(false)
+}
+
+fn visible_charge_video_source_expr() -> sea_orm::sea_query::SimpleExpr {
+    // 全局视频列表没有“当前源”上下文；此处隐藏“仅属于禁用充电下载源”的充电视频。
+    // 如果同一个视频还属于其他未禁用的源，仍允许显示，避免误伤其他源下的同一视频。
+    video::Column::IsChargeVideo.eq(false).or(Expr::cust(
+        r#"
+        (
+            (collection_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM collection source_collection
+                WHERE source_collection.id = video.collection_id
+                  AND source_collection.download_charge_videos = 0
+            ))
+            OR (favorite_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM favorite source_favorite
+                WHERE source_favorite.id = video.favorite_id
+                  AND source_favorite.download_charge_videos = 0
+            ))
+            OR (submission_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM submission source_submission
+                WHERE source_submission.id = video.submission_id
+                  AND source_submission.download_charge_videos = 0
+            ))
+            OR (watch_later_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM watch_later source_watch_later
+                WHERE source_watch_later.id = video.watch_later_id
+                  AND source_watch_later.download_charge_videos = 0
+            ))
+            OR (source_type = 1 AND source_id IS NOT NULL AND NOT EXISTS (
+                SELECT 1 FROM video_source source_bangumi
+                WHERE source_bangumi.id = video.source_id
+                  AND source_bangumi.download_charge_videos = 0
+            ))
+            OR (
+                collection_id IS NULL
+                AND favorite_id IS NULL
+                AND submission_id IS NULL
+                AND watch_later_id IS NULL
+                AND (source_type IS NULL OR source_type <> 1 OR source_id IS NULL)
+            )
+        )
+        "#,
+    ))
+}
 
 fn is_invalid_video_placeholder_title(name: &str) -> bool {
     matches!(name.trim(), "" | "已失效视频" | "失效视频")
@@ -1291,6 +1493,7 @@ mod queue_sse_tests {
             enabled: Set(true),
             scan_deleted_videos: Set(false),
             scan_deleted_videos_once: Set(false),
+            filter_option: Set(None),
             selected_videos: Set(None),
             keyword_filters: Set(None),
             keyword_filter_mode: Set(None),
@@ -1305,8 +1508,11 @@ mod queue_sse_tests {
             audio_only_m4a_only: Set(false),
             flat_folder: Set(false),
             split_chapters_after_download: Set(false),
+            download_charge_videos: Set(true),
             download_danmaku: Set(true),
             download_subtitle: Set(true),
+            download_ai_subtitle: Set(true),
+            ai_subtitle_language: Set("zh-CN".to_string()),
             ai_rename: Set(false),
             ai_rename_video_prompt: Set(String::new()),
             ai_rename_audio_prompt: Set(String::new()),
@@ -1338,6 +1544,7 @@ mod queue_sse_tests {
             enabled: Set(true),
             scan_deleted_videos: Set(false),
             scan_deleted_videos_once: Set(false),
+            filter_option: Set(None),
             cover: Set(None),
             keyword_filters: Set(None),
             keyword_filter_mode: Set(None),
@@ -1355,8 +1562,11 @@ mod queue_sse_tests {
             audio_only_m4a_only: Set(false),
             flat_folder: Set(false),
             split_chapters_after_download: Set(false),
+            download_charge_videos: Set(true),
             download_danmaku: Set(true),
             download_subtitle: Set(true),
+            download_ai_subtitle: Set(true),
+            ai_subtitle_language: Set("zh-CN".to_string()),
             ai_rename: Set(false),
             ai_rename_video_prompt: Set(String::new()),
             ai_rename_audio_prompt: Set(String::new()),
@@ -1381,6 +1591,7 @@ mod queue_sse_tests {
             enabled: Set(true),
             scan_deleted_videos: Set(false),
             scan_deleted_videos_once: Set(false),
+            filter_option: Set(None),
             keyword_filters: Set(None),
             keyword_filter_mode: Set(None),
             blacklist_keywords: Set(None),
@@ -1394,8 +1605,11 @@ mod queue_sse_tests {
             audio_only_m4a_only: Set(false),
             flat_folder: Set(false),
             split_chapters_after_download: Set(false),
+            download_charge_videos: Set(true),
             download_danmaku: Set(true),
             download_subtitle: Set(true),
+            download_ai_subtitle: Set(true),
+            ai_subtitle_language: Set("zh-CN".to_string()),
             ai_rename: Set(false),
             ai_rename_video_prompt: Set(String::new()),
             ai_rename_audio_prompt: Set(String::new()),
@@ -1418,6 +1632,7 @@ mod queue_sse_tests {
             enabled: Set(true),
             scan_deleted_videos: Set(false),
             scan_deleted_videos_once: Set(false),
+            filter_option: Set(None),
             keyword_filters: Set(None),
             keyword_filter_mode: Set(None),
             blacklist_keywords: Set(None),
@@ -1431,8 +1646,11 @@ mod queue_sse_tests {
             audio_only_m4a_only: Set(false),
             flat_folder: Set(false),
             split_chapters_after_download: Set(false),
+            download_charge_videos: Set(true),
             download_danmaku: Set(true),
             download_subtitle: Set(true),
+            download_ai_subtitle: Set(true),
+            ai_subtitle_language: Set("zh-CN".to_string()),
             ai_rename: Set(false),
             ai_rename_video_prompt: Set(String::new()),
             ai_rename_audio_prompt: Set(String::new()),
@@ -1508,6 +1726,29 @@ mod queue_sse_tests {
         .insert(db)
         .await
         .expect("应能插入测试视频");
+    }
+
+    async fn set_test_submission_download_charge_videos(db: &DatabaseConnection, id: i32, enabled: bool) {
+        submission::Entity::update(submission::ActiveModel {
+            id: Unchanged(id),
+            download_charge_videos: Set(enabled),
+            ..Default::default()
+        })
+        .exec(db)
+        .await
+        .expect("应能更新测试投稿源充电视频下载开关");
+    }
+
+    async fn set_test_video_charge(db: &DatabaseConnection, id: i32, is_charge_video: bool) {
+        video::Entity::update(video::ActiveModel {
+            id: Unchanged(id),
+            is_charge_video: Set(is_charge_video),
+            charge_can_play: Set(is_charge_video),
+            ..Default::default()
+        })
+        .exec(db)
+        .await
+        .expect("应能更新测试视频充电状态");
     }
 
     async fn insert_test_page_with_file(
@@ -1904,6 +2145,51 @@ mod queue_sse_tests {
     }
 
     #[tokio::test]
+    async fn get_videos_hides_charge_videos_when_selected_source_disables_charge_download() {
+        let db = create_test_db("videos-hide-charge-by-source").await;
+        insert_test_submission(db.as_ref(), 1, "测试投稿源").await;
+        set_test_submission_download_charge_videos(db.as_ref(), 1, false).await;
+        insert_test_video(db.as_ref(), 1, "普通视频").await;
+        insert_test_video(db.as_ref(), 2, "充电视频").await;
+        set_test_video_charge(db.as_ref(), 2, true).await;
+
+        let all_response = get_videos(
+            Extension(db.clone()),
+            Query(VideosRequest {
+                page: Some(0),
+                page_size: Some(10),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("全局视频列表应按源开关隐藏充电视频")
+        .into_data();
+
+        assert_eq!(all_response.total_count, 1, "全局列表应隐藏禁用源的充电视频");
+        assert_eq!(all_response.videos.len(), 1);
+        assert_eq!(all_response.videos[0].id, 1);
+        assert!(!all_response.videos[0].is_charge_video);
+
+        let response = get_videos(
+            Extension(db.clone()),
+            Query(VideosRequest {
+                submission: Some(1),
+                page: Some(0),
+                page_size: Some(10),
+                ..Default::default()
+            }),
+        )
+        .await
+        .expect("按禁用充电下载的源筛选视频应返回成功")
+        .into_data();
+
+        assert_eq!(response.total_count, 1, "禁用源筛选时应隐藏该源的充电视频");
+        assert_eq!(response.videos.len(), 1);
+        assert_eq!(response.videos[0].id, 1);
+        assert!(!response.videos[0].is_charge_video);
+    }
+
+    #[tokio::test]
     async fn test_enable_persistent_scan_deleted_clears_once_flag() {
         let db = create_test_db("scan-deleted-persistent").await;
         insert_test_submission(db.as_ref(), 1, "测试投稿源").await;
@@ -2221,6 +2507,7 @@ pub async fn get_video_sources(
                 latest_row_at: normalize_video_source_latest_row_at(&model.latest_row_at),
                 scan_deleted_videos: model.scan_deleted_videos,
                 scan_deleted_videos_once: model.scan_deleted_videos_once,
+                filter_option: model.filter_option.and_then(|value| serde_json::from_value(value).ok()),
                 f_id: None,
                 s_id: Some(model.s_id),
                 m_id: Some(model.m_id),
@@ -2244,8 +2531,11 @@ pub async fn get_video_sources(
                 audio_only_m4a_only: model.audio_only_m4a_only,
                 flat_folder: model.flat_folder,
                 split_chapters_after_download: model.split_chapters_after_download,
+                download_charge_videos: model.download_charge_videos,
                 download_danmaku: model.download_danmaku,
                 download_subtitle: model.download_subtitle,
+                download_ai_subtitle: model.download_ai_subtitle,
+                ai_subtitle_language: model.ai_subtitle_language,
                 ai_rename: model.ai_rename,
                 ai_rename_video_prompt: model.ai_rename_video_prompt,
                 ai_rename_audio_prompt: model.ai_rename_audio_prompt,
@@ -2283,6 +2573,7 @@ pub async fn get_video_sources(
                 latest_row_at: normalize_video_source_latest_row_at(&model.latest_row_at),
                 scan_deleted_videos: model.scan_deleted_videos,
                 scan_deleted_videos_once: model.scan_deleted_videos_once,
+                filter_option: model.filter_option.and_then(|value| serde_json::from_value(value).ok()),
                 f_id: Some(model.f_id),
                 s_id: None,
                 m_id: None,
@@ -2306,8 +2597,11 @@ pub async fn get_video_sources(
                 audio_only_m4a_only: model.audio_only_m4a_only,
                 flat_folder: model.flat_folder,
                 split_chapters_after_download: model.split_chapters_after_download,
+                download_charge_videos: model.download_charge_videos,
                 download_danmaku: model.download_danmaku,
                 download_subtitle: model.download_subtitle,
+                download_ai_subtitle: model.download_ai_subtitle,
+                ai_subtitle_language: model.ai_subtitle_language,
                 ai_rename: model.ai_rename,
                 ai_rename_video_prompt: model.ai_rename_video_prompt,
                 ai_rename_audio_prompt: model.ai_rename_audio_prompt,
@@ -2345,6 +2639,7 @@ pub async fn get_video_sources(
                 latest_row_at: normalize_video_source_latest_row_at(&model.latest_row_at),
                 scan_deleted_videos: model.scan_deleted_videos,
                 scan_deleted_videos_once: model.scan_deleted_videos_once,
+                filter_option: model.filter_option.and_then(|value| serde_json::from_value(value).ok()),
                 f_id: None,
                 s_id: None,
                 m_id: None,
@@ -2368,8 +2663,11 @@ pub async fn get_video_sources(
                 audio_only_m4a_only: model.audio_only_m4a_only,
                 flat_folder: model.flat_folder,
                 split_chapters_after_download: model.split_chapters_after_download,
+                download_charge_videos: model.download_charge_videos,
                 download_danmaku: model.download_danmaku,
                 download_subtitle: model.download_subtitle,
+                download_ai_subtitle: model.download_ai_subtitle,
+                ai_subtitle_language: model.ai_subtitle_language,
                 ai_rename: model.ai_rename,
                 ai_rename_video_prompt: model.ai_rename_video_prompt,
                 ai_rename_audio_prompt: model.ai_rename_audio_prompt,
@@ -2407,6 +2705,7 @@ pub async fn get_video_sources(
                 latest_row_at: normalize_video_source_latest_row_at(&model.latest_row_at),
                 scan_deleted_videos: model.scan_deleted_videos,
                 scan_deleted_videos_once: model.scan_deleted_videos_once,
+                filter_option: model.filter_option.and_then(|value| serde_json::from_value(value).ok()),
                 f_id: None,
                 s_id: None,
                 m_id: None,
@@ -2430,8 +2729,11 @@ pub async fn get_video_sources(
                 audio_only_m4a_only: model.audio_only_m4a_only,
                 flat_folder: model.flat_folder,
                 split_chapters_after_download: model.split_chapters_after_download,
+                download_charge_videos: model.download_charge_videos,
                 download_danmaku: model.download_danmaku,
                 download_subtitle: model.download_subtitle,
+                download_ai_subtitle: model.download_ai_subtitle,
+                ai_subtitle_language: model.ai_subtitle_language,
                 ai_rename: model.ai_rename,
                 ai_rename_video_prompt: model.ai_rename_video_prompt,
                 ai_rename_audio_prompt: model.ai_rename_audio_prompt,
@@ -2488,6 +2790,7 @@ pub async fn get_video_sources(
                 latest_row_at: normalize_video_source_latest_row_at(&model.latest_row_at),
                 scan_deleted_videos: model.scan_deleted_videos,
                 scan_deleted_videos_once: model.scan_deleted_videos_once,
+                filter_option: model.filter_option.and_then(|value| serde_json::from_value(value).ok()),
                 f_id: None,
                 s_id: None,
                 m_id: None,
@@ -2511,8 +2814,11 @@ pub async fn get_video_sources(
                 audio_only_m4a_only: model.audio_only_m4a_only,
                 flat_folder: model.flat_folder,
                 split_chapters_after_download: model.split_chapters_after_download,
+                download_charge_videos: model.download_charge_videos,
                 download_danmaku: model.download_danmaku,
                 download_subtitle: model.download_subtitle,
+                download_ai_subtitle: model.download_ai_subtitle,
+                ai_subtitle_language: model.ai_subtitle_language,
                 ai_rename: model.ai_rename,
                 ai_rename_video_prompt: model.ai_rename_video_prompt,
                 ai_rename_audio_prompt: model.ai_rename_audio_prompt,
@@ -2650,6 +2956,12 @@ pub async fn get_videos(
                 query = query.filter(column.eq(id));
             }
         }
+    }
+    let source_filters = SourceChargeVisibilityFilters::from(&params);
+    if should_hide_charge_videos_for_source_filters(db.as_ref(), source_filters).await? {
+        query = query.filter(video::Column::IsChargeVideo.eq(false));
+    } else if !source_filters.has_any() {
+        query = query.filter(visible_charge_video_source_expr());
     }
     if let Some(query_word) = params.query {
         query = query.filter(
@@ -3679,6 +3991,12 @@ pub async fn reset_all_videos(
             }
         }
     }
+    let source_filters = SourceChargeVisibilityFilters::from(&params);
+    if should_hide_charge_videos_for_source_filters(db.as_ref(), source_filters).await? {
+        video_query = video_query.filter(video::Column::IsChargeVideo.eq(false));
+    } else if !source_filters.has_any() {
+        video_query = video_query.filter(visible_charge_video_source_expr());
+    }
 
     if let Some(query_word) = params.query.as_ref() {
         video_query = video_query.filter(
@@ -3911,13 +4229,28 @@ pub async fn reset_specific_tasks(
 ) -> Result<ApiResponse<ResetAllVideosResponse>, ApiError> {
     use std::collections::HashSet;
 
-    let task_indexes = &request.task_indexes;
-    if task_indexes.is_empty() {
+    let mut video_task_indexes = if request.video_task_indexes.is_empty() {
+        request.task_indexes.clone()
+    } else {
+        request.video_task_indexes.clone()
+    };
+    let mut page_task_indexes = if request.page_task_indexes.is_empty() {
+        request.task_indexes.clone()
+    } else {
+        request.page_task_indexes.clone()
+    };
+
+    video_task_indexes.sort_unstable();
+    video_task_indexes.dedup();
+    page_task_indexes.sort_unstable();
+    page_task_indexes.dedup();
+
+    if video_task_indexes.is_empty() && page_task_indexes.is_empty() {
         return Err(crate::api::error::InnerApiError::BadRequest("至少需要选择一个任务".to_string()).into());
     }
 
     // 验证任务索引范围
-    for &index in task_indexes {
+    for &index in video_task_indexes.iter().chain(page_task_indexes.iter()) {
         if index > 4 {
             return Err(crate::api::error::InnerApiError::BadRequest(format!("无效的任务索引: {}", index)).into());
         }
@@ -3949,6 +4282,12 @@ pub async fn reset_specific_tasks(
                 video_query = video_query.filter(column.eq(id));
             }
         }
+    }
+    let source_filters = SourceChargeVisibilityFilters::from(&request);
+    if should_hide_charge_videos_for_source_filters(db.as_ref(), source_filters).await? {
+        video_query = video_query.filter(video::Column::IsChargeVideo.eq(false));
+    } else if !source_filters.has_any() {
+        video_query = video_query.filter(visible_charge_video_source_expr());
     }
 
     if let Some(query_word) = request.query.as_ref() {
@@ -4074,7 +4413,7 @@ pub async fn reset_specific_tasks(
             let mut page_resetted = false;
 
             // 重置指定的任务索引：默认仅重置失败任务；force=true 时重置所有非 0 状态
-            for &task_index in task_indexes {
+            for &task_index in &page_task_indexes {
                 if task_index < 5 {
                     let current_status = page_status.get(task_index);
                     let should_reset = if force_reset {
@@ -4133,7 +4472,7 @@ pub async fn reset_specific_tasks(
             let mut video_resetted = false;
 
             // 重置指定任务：默认仅重置失败任务；force=true 时重置所有非 0 状态
-            for &task_index in task_indexes {
+            for &task_index in &video_task_indexes {
                 if task_index < 5 {
                     let current_status = video_status.get(task_index);
                     let should_reset = if force_reset {
@@ -4201,7 +4540,7 @@ pub async fn reset_specific_tasks(
 
     // 重置视频封面时，同步删除根目录 poster.jpg / folder.jpg，
     // 以便下次执行封面任务时可以重新下载（否则会被“存在即跳过”优化拦截）。
-    if task_indexes.contains(&0) {
+    if video_task_indexes.contains(&0) || page_task_indexes.contains(&0) {
         use tokio::fs;
 
         let config = crate::config::reload_config();
@@ -4560,6 +4899,8 @@ pub async fn add_video_source(
             up_id: params.up_id.clone(),
             collection_type: params.collection_type.clone(),
             collection_aggregate_enabled: params.collection_aggregate_enabled,
+            filter_option: params.filter_option.clone(),
+            download_charge_videos: params.download_charge_videos,
             media_id: params.media_id.clone(),
             ep_id: params.ep_id.clone(),
             download_all_seasons: params.download_all_seasons,
@@ -4597,6 +4938,9 @@ pub async fn add_video_source_internal(
     // 使用主数据库连接
 
     let txn = crate::database::begin_traced_transaction(&db, "api.handler.add_video_source").await?;
+    let ai_subtitle_language =
+        ai_subtitle_language_from_request(&params.ai_subtitle_language, DEFAULT_AI_SUBTITLE_LANGUAGE);
+    let source_filter_option = source_filter_option_to_json(&params.filter_option)?;
 
     let result = match params.source_type.as_str() {
         "collection" => {
@@ -4707,6 +5051,7 @@ pub async fn add_video_source_internal(
                 enabled: sea_orm::Set(true),
                 scan_deleted_videos: sea_orm::Set(false),
                 scan_deleted_videos_once: sea_orm::Set(false),
+                filter_option: sea_orm::Set(source_filter_option.clone()),
                 cover: sea_orm::Set(cover_url),
                 keyword_filters: sea_orm::Set(keyword_filters_json),
                 keyword_filter_mode: sea_orm::Set(keyword_filter_mode),
@@ -4726,8 +5071,11 @@ pub async fn add_video_source_internal(
                 audio_only_m4a_only: sea_orm::Set(params.audio_only_m4a_only.unwrap_or(false)),
                 flat_folder: sea_orm::Set(params.flat_folder.unwrap_or(false)),
                 split_chapters_after_download: sea_orm::Set(params.split_chapters_after_download.unwrap_or(false)),
+                download_charge_videos: sea_orm::Set(params.download_charge_videos.unwrap_or(true)),
                 download_danmaku: sea_orm::Set(params.download_danmaku.unwrap_or(true)),
                 download_subtitle: sea_orm::Set(params.download_subtitle.unwrap_or(true)),
+                download_ai_subtitle: sea_orm::Set(params.download_ai_subtitle.unwrap_or(true)),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(params.ai_rename.unwrap_or(false)),
                 ai_rename_video_prompt: sea_orm::Set(params.ai_rename_video_prompt.clone().unwrap_or_default()),
                 ai_rename_audio_prompt: sea_orm::Set(params.ai_rename_audio_prompt.clone().unwrap_or_default()),
@@ -4813,6 +5161,7 @@ pub async fn add_video_source_internal(
                 enabled: sea_orm::Set(true),
                 scan_deleted_videos: sea_orm::Set(false),
                 scan_deleted_videos_once: sea_orm::Set(false),
+                filter_option: sea_orm::Set(source_filter_option.clone()),
                 keyword_filters: sea_orm::Set(keyword_filters_json),
                 keyword_filter_mode: sea_orm::Set(keyword_filter_mode),
                 blacklist_keywords: sea_orm::Set(None),
@@ -4826,8 +5175,11 @@ pub async fn add_video_source_internal(
                 audio_only_m4a_only: sea_orm::Set(params.audio_only_m4a_only.unwrap_or(false)),
                 flat_folder: sea_orm::Set(params.flat_folder.unwrap_or(false)),
                 split_chapters_after_download: sea_orm::Set(params.split_chapters_after_download.unwrap_or(false)),
+                download_charge_videos: sea_orm::Set(params.download_charge_videos.unwrap_or(true)),
                 download_danmaku: sea_orm::Set(params.download_danmaku.unwrap_or(true)),
                 download_subtitle: sea_orm::Set(params.download_subtitle.unwrap_or(true)),
+                download_ai_subtitle: sea_orm::Set(params.download_ai_subtitle.unwrap_or(true)),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(params.ai_rename.unwrap_or(false)),
                 ai_rename_video_prompt: sea_orm::Set(params.ai_rename_video_prompt.clone().unwrap_or_default()),
                 ai_rename_audio_prompt: sea_orm::Set(params.ai_rename_audio_prompt.clone().unwrap_or_default()),
@@ -4892,6 +5244,7 @@ pub async fn add_video_source_internal(
                 last_scan_at: sea_orm::Set(None),
                 next_scan_at: sea_orm::Set(None),
                 no_update_streak: sea_orm::Set(0),
+                filter_option: sea_orm::Set(source_filter_option.clone()),
                 selected_videos: sea_orm::Set(
                     params
                         .selected_videos
@@ -4909,6 +5262,8 @@ pub async fn add_video_source_internal(
                 audio_only: sea_orm::Set(params.audio_only.unwrap_or(false)),
                 download_danmaku: sea_orm::Set(params.download_danmaku.unwrap_or(true)),
                 download_subtitle: sea_orm::Set(params.download_subtitle.unwrap_or(true)),
+                download_ai_subtitle: sea_orm::Set(params.download_ai_subtitle.unwrap_or(true)),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(params.ai_rename.unwrap_or(false)),
                 ai_rename_video_prompt: sea_orm::Set(params.ai_rename_video_prompt.clone().unwrap_or_default()),
                 ai_rename_audio_prompt: sea_orm::Set(params.ai_rename_audio_prompt.clone().unwrap_or_default()),
@@ -4919,6 +5274,7 @@ pub async fn add_video_source_internal(
                 audio_only_m4a_only: sea_orm::Set(params.audio_only_m4a_only.unwrap_or(false)),
                 flat_folder: sea_orm::Set(params.flat_folder.unwrap_or(false)),
                 split_chapters_after_download: sea_orm::Set(params.split_chapters_after_download.unwrap_or(false)),
+                download_charge_videos: sea_orm::Set(params.download_charge_videos.unwrap_or(true)),
                 use_dynamic_api: sea_orm::Set(params.use_dynamic_api.unwrap_or(false)),
                 dynamic_api_full_synced: sea_orm::Set(params.use_dynamic_api.unwrap_or(false)),
             };
@@ -5065,6 +5421,17 @@ pub async fn add_video_source_internal(
                     merge_message.push_str(&format!("番剧名称已更新为: {}", params.name));
                 }
 
+                // 更新源级流过滤配置（如果添加请求携带了自定义配置）
+                if source_filter_option.is_some() && source_filter_option != existing.filter_option {
+                    existing.filter_option = source_filter_option.clone();
+                    updated = true;
+
+                    if !merge_message.is_empty() {
+                        merge_message.push('，');
+                    }
+                    merge_message.push_str("源级码率设置已更新");
+                }
+
                 if updated {
                     // 更新数据库记录 - 修复：正确使用ActiveModel更新
                     let mut existing_update = video_source::ActiveModel {
@@ -5094,6 +5461,10 @@ pub async fn add_video_source_internal(
                     // 更新名称（如果有变更）
                     if !params.name.is_empty() && params.name != existing.name {
                         existing_update.name = sea_orm::Set(params.name.clone());
+                    }
+
+                    if source_filter_option.is_some() {
+                        existing_update.filter_option = sea_orm::Set(source_filter_option.clone());
                     }
 
                     video_source::Entity::update(existing_update).exec(&txn).await?;
@@ -5218,14 +5589,18 @@ pub async fn add_video_source_internal(
                     ep_id: sea_orm::Set(params.ep_id),
                     scan_deleted_videos: sea_orm::Set(false),
                     scan_deleted_videos_once: sea_orm::Set(false),
+                    filter_option: sea_orm::Set(source_filter_option.clone()),
                     download_all_seasons: sea_orm::Set(Some(download_all_seasons)),
                     selected_seasons: sea_orm::Set(selected_seasons_json),
                     keyword_filters: sea_orm::Set(keyword_filters_json),
                     keyword_filter_mode: sea_orm::Set(keyword_filter_mode),
                     audio_only: sea_orm::Set(params.audio_only.unwrap_or(false)),
                     split_chapters_after_download: sea_orm::Set(params.split_chapters_after_download.unwrap_or(false)),
+                    download_charge_videos: sea_orm::Set(params.download_charge_videos.unwrap_or(true)),
                     download_danmaku: sea_orm::Set(params.download_danmaku.unwrap_or(true)),
                     download_subtitle: sea_orm::Set(params.download_subtitle.unwrap_or(true)),
+                    download_ai_subtitle: sea_orm::Set(params.download_ai_subtitle.unwrap_or(true)),
+                    ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                     ai_rename: sea_orm::Set(params.ai_rename.unwrap_or(false)),
                     ai_rename_video_prompt: sea_orm::Set(params.ai_rename_video_prompt.clone().unwrap_or_default()),
                     ai_rename_audio_prompt: sea_orm::Set(params.ai_rename_audio_prompt.clone().unwrap_or_default()),
@@ -5296,6 +5671,7 @@ pub async fn add_video_source_internal(
                 enabled: sea_orm::Set(true),
                 scan_deleted_videos: sea_orm::Set(false),
                 scan_deleted_videos_once: sea_orm::Set(false),
+                filter_option: sea_orm::Set(source_filter_option.clone()),
                 keyword_filters: sea_orm::Set(keyword_filters_json),
                 keyword_filter_mode: sea_orm::Set(keyword_filter_mode),
                 blacklist_keywords: sea_orm::Set(None),
@@ -5308,6 +5684,8 @@ pub async fn add_video_source_internal(
                 audio_only: sea_orm::Set(params.audio_only.unwrap_or(false)),
                 download_danmaku: sea_orm::Set(params.download_danmaku.unwrap_or(true)),
                 download_subtitle: sea_orm::Set(params.download_subtitle.unwrap_or(true)),
+                download_ai_subtitle: sea_orm::Set(params.download_ai_subtitle.unwrap_or(true)),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(params.ai_rename.unwrap_or(false)),
                 ai_rename_video_prompt: sea_orm::Set(params.ai_rename_video_prompt.clone().unwrap_or_default()),
                 ai_rename_audio_prompt: sea_orm::Set(params.ai_rename_audio_prompt.clone().unwrap_or_default()),
@@ -5318,6 +5696,7 @@ pub async fn add_video_source_internal(
                 audio_only_m4a_only: sea_orm::Set(params.audio_only_m4a_only.unwrap_or(false)),
                 flat_folder: sea_orm::Set(params.flat_folder.unwrap_or(false)),
                 split_chapters_after_download: sea_orm::Set(params.split_chapters_after_download.unwrap_or(false)),
+                download_charge_videos: sea_orm::Set(params.download_charge_videos.unwrap_or(true)),
             };
 
             let insert_result = watch_later::Entity::insert(watch_later).exec(&txn).await?;
@@ -7676,8 +8055,14 @@ pub async fn update_video_source_download_options_internal(
             let split_chapters_after_download = params
                 .split_chapters_after_download
                 .unwrap_or(collection.split_chapters_after_download);
+            let download_charge_videos = params
+                .download_charge_videos
+                .unwrap_or(collection.download_charge_videos);
             let download_danmaku = params.download_danmaku.unwrap_or(collection.download_danmaku);
             let download_subtitle = params.download_subtitle.unwrap_or(collection.download_subtitle);
+            let download_ai_subtitle = params.download_ai_subtitle.unwrap_or(collection.download_ai_subtitle);
+            let ai_subtitle_language =
+                ai_subtitle_language_from_request(&params.ai_subtitle_language, &collection.ai_subtitle_language);
             let collection_aggregate_enabled = params
                 .collection_aggregate_enabled
                 .unwrap_or(collection.aggregate_enabled);
@@ -7715,6 +8100,9 @@ pub async fn update_video_source_download_options_internal(
             let ai_rename_rename_parent_dir = params
                 .ai_rename_rename_parent_dir
                 .unwrap_or(collection.ai_rename_rename_parent_dir);
+            let filter_option =
+                resolve_source_filter_option_update(collection.filter_option.clone(), &params.filter_option)?;
+            let response_filter_option = source_filter_option_to_response(filter_option.clone())?;
 
             collection::Entity::update(collection::ActiveModel {
                 id: sea_orm::ActiveValue::Unchanged(id),
@@ -7724,8 +8112,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only: sea_orm::Set(audio_only_m4a_only),
                 flat_folder: sea_orm::Set(flat_folder),
                 split_chapters_after_download: sea_orm::Set(split_chapters_after_download),
+                download_charge_videos: sea_orm::Set(download_charge_videos),
                 download_danmaku: sea_orm::Set(download_danmaku),
                 download_subtitle: sea_orm::Set(download_subtitle),
+                download_ai_subtitle: sea_orm::Set(download_ai_subtitle),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(ai_rename),
                 ai_rename_video_prompt: sea_orm::Set(ai_rename_video_prompt.clone()),
                 ai_rename_audio_prompt: sea_orm::Set(ai_rename_audio_prompt.clone()),
@@ -7733,6 +8124,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_collection: sea_orm::Set(ai_rename_enable_collection),
                 ai_rename_enable_bangumi: sea_orm::Set(ai_rename_enable_bangumi),
                 ai_rename_rename_parent_dir: sea_orm::Set(ai_rename_rename_parent_dir),
+                filter_option: sea_orm::Set(filter_option),
                 ..Default::default()
             })
             .exec(&txn)
@@ -7748,8 +8140,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only,
                 flat_folder,
                 split_chapters_after_download,
+                download_charge_videos,
                 download_danmaku,
                 download_subtitle,
+                download_ai_subtitle,
+                ai_subtitle_language,
                 ai_rename,
                 ai_rename_video_prompt,
                 ai_rename_audio_prompt,
@@ -7758,6 +8153,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_bangumi,
                 ai_rename_rename_parent_dir,
                 use_dynamic_api: false,
+                filter_option: response_filter_option,
                 message: format!("合集 {} 的下载选项已更新", collection.name),
             }
         }
@@ -7773,8 +8169,12 @@ pub async fn update_video_source_download_options_internal(
             let split_chapters_after_download = params
                 .split_chapters_after_download
                 .unwrap_or(favorite.split_chapters_after_download);
+            let download_charge_videos = params.download_charge_videos.unwrap_or(favorite.download_charge_videos);
             let download_danmaku = params.download_danmaku.unwrap_or(favorite.download_danmaku);
             let download_subtitle = params.download_subtitle.unwrap_or(favorite.download_subtitle);
+            let download_ai_subtitle = params.download_ai_subtitle.unwrap_or(favorite.download_ai_subtitle);
+            let ai_subtitle_language =
+                ai_subtitle_language_from_request(&params.ai_subtitle_language, &favorite.ai_subtitle_language);
             let ai_rename = params.ai_rename.unwrap_or(favorite.ai_rename);
             let ai_rename_video_prompt = params
                 .ai_rename_video_prompt
@@ -7796,6 +8196,9 @@ pub async fn update_video_source_download_options_internal(
             let ai_rename_rename_parent_dir = params
                 .ai_rename_rename_parent_dir
                 .unwrap_or(favorite.ai_rename_rename_parent_dir);
+            let filter_option =
+                resolve_source_filter_option_update(favorite.filter_option.clone(), &params.filter_option)?;
+            let response_filter_option = source_filter_option_to_response(filter_option.clone())?;
 
             favorite::Entity::update(favorite::ActiveModel {
                 id: sea_orm::ActiveValue::Unchanged(id),
@@ -7803,8 +8206,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only: sea_orm::Set(audio_only_m4a_only),
                 flat_folder: sea_orm::Set(flat_folder),
                 split_chapters_after_download: sea_orm::Set(split_chapters_after_download),
+                download_charge_videos: sea_orm::Set(download_charge_videos),
                 download_danmaku: sea_orm::Set(download_danmaku),
                 download_subtitle: sea_orm::Set(download_subtitle),
+                download_ai_subtitle: sea_orm::Set(download_ai_subtitle),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(ai_rename),
                 ai_rename_video_prompt: sea_orm::Set(ai_rename_video_prompt.clone()),
                 ai_rename_audio_prompt: sea_orm::Set(ai_rename_audio_prompt.clone()),
@@ -7812,6 +8218,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_collection: sea_orm::Set(ai_rename_enable_collection),
                 ai_rename_enable_bangumi: sea_orm::Set(ai_rename_enable_bangumi),
                 ai_rename_rename_parent_dir: sea_orm::Set(ai_rename_rename_parent_dir),
+                filter_option: sea_orm::Set(filter_option),
                 ..Default::default()
             })
             .exec(&txn)
@@ -7827,8 +8234,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only,
                 flat_folder,
                 split_chapters_after_download,
+                download_charge_videos,
                 download_danmaku,
                 download_subtitle,
+                download_ai_subtitle,
+                ai_subtitle_language,
                 ai_rename,
                 ai_rename_video_prompt,
                 ai_rename_audio_prompt,
@@ -7837,6 +8247,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_bangumi,
                 ai_rename_rename_parent_dir,
                 use_dynamic_api: false,
+                filter_option: response_filter_option,
                 message: format!("收藏夹 {} 的下载选项已更新", favorite.name),
             }
         }
@@ -7852,8 +8263,14 @@ pub async fn update_video_source_download_options_internal(
             let split_chapters_after_download = params
                 .split_chapters_after_download
                 .unwrap_or(submission.split_chapters_after_download);
+            let download_charge_videos = params
+                .download_charge_videos
+                .unwrap_or(submission.download_charge_videos);
             let download_danmaku = params.download_danmaku.unwrap_or(submission.download_danmaku);
             let download_subtitle = params.download_subtitle.unwrap_or(submission.download_subtitle);
+            let download_ai_subtitle = params.download_ai_subtitle.unwrap_or(submission.download_ai_subtitle);
+            let ai_subtitle_language =
+                ai_subtitle_language_from_request(&params.ai_subtitle_language, &submission.ai_subtitle_language);
             let ai_rename = params.ai_rename.unwrap_or(submission.ai_rename);
             let ai_rename_video_prompt = params
                 .ai_rename_video_prompt
@@ -7876,6 +8293,9 @@ pub async fn update_video_source_download_options_internal(
                 .ai_rename_rename_parent_dir
                 .unwrap_or(submission.ai_rename_rename_parent_dir);
             let use_dynamic_api = params.use_dynamic_api.unwrap_or(submission.use_dynamic_api);
+            let filter_option =
+                resolve_source_filter_option_update(submission.filter_option.clone(), &params.filter_option)?;
+            let response_filter_option = source_filter_option_to_response(filter_option.clone())?;
             let mut dynamic_api_full_synced = submission.dynamic_api_full_synced;
             let mut latest_row_at_override: Option<String> = None;
 
@@ -7894,8 +8314,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only: sea_orm::Set(audio_only_m4a_only),
                 flat_folder: sea_orm::Set(flat_folder),
                 split_chapters_after_download: sea_orm::Set(split_chapters_after_download),
+                download_charge_videos: sea_orm::Set(download_charge_videos),
                 download_danmaku: sea_orm::Set(download_danmaku),
                 download_subtitle: sea_orm::Set(download_subtitle),
+                download_ai_subtitle: sea_orm::Set(download_ai_subtitle),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(ai_rename),
                 ai_rename_video_prompt: sea_orm::Set(ai_rename_video_prompt.clone()),
                 ai_rename_audio_prompt: sea_orm::Set(ai_rename_audio_prompt.clone()),
@@ -7905,6 +8328,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_rename_parent_dir: sea_orm::Set(ai_rename_rename_parent_dir),
                 use_dynamic_api: sea_orm::Set(use_dynamic_api),
                 dynamic_api_full_synced: sea_orm::Set(dynamic_api_full_synced),
+                filter_option: sea_orm::Set(filter_option),
                 ..Default::default()
             };
 
@@ -7924,8 +8348,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only,
                 flat_folder,
                 split_chapters_after_download,
+                download_charge_videos,
                 download_danmaku,
                 download_subtitle,
+                download_ai_subtitle,
+                ai_subtitle_language,
                 ai_rename,
                 ai_rename_video_prompt,
                 ai_rename_audio_prompt,
@@ -7934,6 +8361,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_bangumi,
                 ai_rename_rename_parent_dir,
                 use_dynamic_api,
+                filter_option: response_filter_option,
                 message: format!("UP主投稿 {} 的下载选项已更新", submission.upper_name),
             }
         }
@@ -7949,8 +8377,14 @@ pub async fn update_video_source_download_options_internal(
             let split_chapters_after_download = params
                 .split_chapters_after_download
                 .unwrap_or(watch_later.split_chapters_after_download);
+            let download_charge_videos = params
+                .download_charge_videos
+                .unwrap_or(watch_later.download_charge_videos);
             let download_danmaku = params.download_danmaku.unwrap_or(watch_later.download_danmaku);
             let download_subtitle = params.download_subtitle.unwrap_or(watch_later.download_subtitle);
+            let download_ai_subtitle = params.download_ai_subtitle.unwrap_or(watch_later.download_ai_subtitle);
+            let ai_subtitle_language =
+                ai_subtitle_language_from_request(&params.ai_subtitle_language, &watch_later.ai_subtitle_language);
             let ai_rename = params.ai_rename.unwrap_or(watch_later.ai_rename);
             let ai_rename_video_prompt = params
                 .ai_rename_video_prompt
@@ -7972,6 +8406,9 @@ pub async fn update_video_source_download_options_internal(
             let ai_rename_rename_parent_dir = params
                 .ai_rename_rename_parent_dir
                 .unwrap_or(watch_later.ai_rename_rename_parent_dir);
+            let filter_option =
+                resolve_source_filter_option_update(watch_later.filter_option.clone(), &params.filter_option)?;
+            let response_filter_option = source_filter_option_to_response(filter_option.clone())?;
 
             watch_later::Entity::update(watch_later::ActiveModel {
                 id: sea_orm::ActiveValue::Unchanged(id),
@@ -7979,8 +8416,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only: sea_orm::Set(audio_only_m4a_only),
                 flat_folder: sea_orm::Set(flat_folder),
                 split_chapters_after_download: sea_orm::Set(split_chapters_after_download),
+                download_charge_videos: sea_orm::Set(download_charge_videos),
                 download_danmaku: sea_orm::Set(download_danmaku),
                 download_subtitle: sea_orm::Set(download_subtitle),
+                download_ai_subtitle: sea_orm::Set(download_ai_subtitle),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(ai_rename),
                 ai_rename_video_prompt: sea_orm::Set(ai_rename_video_prompt.clone()),
                 ai_rename_audio_prompt: sea_orm::Set(ai_rename_audio_prompt.clone()),
@@ -7988,6 +8428,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_collection: sea_orm::Set(ai_rename_enable_collection),
                 ai_rename_enable_bangumi: sea_orm::Set(ai_rename_enable_bangumi),
                 ai_rename_rename_parent_dir: sea_orm::Set(ai_rename_rename_parent_dir),
+                filter_option: sea_orm::Set(filter_option),
                 ..Default::default()
             })
             .exec(&txn)
@@ -8003,8 +8444,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only,
                 flat_folder,
                 split_chapters_after_download,
+                download_charge_videos,
                 download_danmaku,
                 download_subtitle,
+                download_ai_subtitle,
+                ai_subtitle_language,
                 ai_rename,
                 ai_rename_video_prompt,
                 ai_rename_audio_prompt,
@@ -8013,6 +8457,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_bangumi,
                 ai_rename_rename_parent_dir,
                 use_dynamic_api: false,
+                filter_option: response_filter_option,
                 message: "稍后观看的下载选项已更新".to_string(),
             }
         }
@@ -8028,8 +8473,14 @@ pub async fn update_video_source_download_options_internal(
             let split_chapters_after_download = params
                 .split_chapters_after_download
                 .unwrap_or(video_source.split_chapters_after_download);
+            let download_charge_videos = params
+                .download_charge_videos
+                .unwrap_or(video_source.download_charge_videos);
             let download_danmaku = params.download_danmaku.unwrap_or(video_source.download_danmaku);
             let download_subtitle = params.download_subtitle.unwrap_or(video_source.download_subtitle);
+            let download_ai_subtitle = params.download_ai_subtitle.unwrap_or(video_source.download_ai_subtitle);
+            let ai_subtitle_language =
+                ai_subtitle_language_from_request(&params.ai_subtitle_language, &video_source.ai_subtitle_language);
             let ai_rename = params.ai_rename.unwrap_or(video_source.ai_rename);
             let ai_rename_video_prompt = params
                 .ai_rename_video_prompt
@@ -8051,6 +8502,9 @@ pub async fn update_video_source_download_options_internal(
             let ai_rename_rename_parent_dir = params
                 .ai_rename_rename_parent_dir
                 .unwrap_or(video_source.ai_rename_rename_parent_dir);
+            let filter_option =
+                resolve_source_filter_option_update(video_source.filter_option.clone(), &params.filter_option)?;
+            let response_filter_option = source_filter_option_to_response(filter_option.clone())?;
 
             video_source::Entity::update(video_source::ActiveModel {
                 id: sea_orm::ActiveValue::Unchanged(id),
@@ -8058,8 +8512,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only: sea_orm::Set(audio_only_m4a_only),
                 flat_folder: sea_orm::Set(flat_folder),
                 split_chapters_after_download: sea_orm::Set(split_chapters_after_download),
+                download_charge_videos: sea_orm::Set(download_charge_videos),
                 download_danmaku: sea_orm::Set(download_danmaku),
                 download_subtitle: sea_orm::Set(download_subtitle),
+                download_ai_subtitle: sea_orm::Set(download_ai_subtitle),
+                ai_subtitle_language: sea_orm::Set(ai_subtitle_language.clone()),
                 ai_rename: sea_orm::Set(ai_rename),
                 ai_rename_video_prompt: sea_orm::Set(ai_rename_video_prompt.clone()),
                 ai_rename_audio_prompt: sea_orm::Set(ai_rename_audio_prompt.clone()),
@@ -8067,6 +8524,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_collection: sea_orm::Set(ai_rename_enable_collection),
                 ai_rename_enable_bangumi: sea_orm::Set(ai_rename_enable_bangumi),
                 ai_rename_rename_parent_dir: sea_orm::Set(ai_rename_rename_parent_dir),
+                filter_option: sea_orm::Set(filter_option),
                 ..Default::default()
             })
             .exec(&txn)
@@ -8082,8 +8540,11 @@ pub async fn update_video_source_download_options_internal(
                 audio_only_m4a_only,
                 flat_folder,
                 split_chapters_after_download,
+                download_charge_videos,
                 download_danmaku,
                 download_subtitle,
+                download_ai_subtitle,
+                ai_subtitle_language,
                 ai_rename,
                 ai_rename_video_prompt,
                 ai_rename_audio_prompt,
@@ -8092,6 +8553,7 @@ pub async fn update_video_source_download_options_internal(
                 ai_rename_enable_bangumi,
                 ai_rename_rename_parent_dir,
                 use_dynamic_api: false,
+                filter_option: response_filter_option,
                 message: format!("番剧 {} 的下载选项已更新", video_source.name),
             }
         }
@@ -8100,6 +8562,9 @@ pub async fn update_video_source_download_options_internal(
 
     txn.commit().await?;
     notify_video_sources_changed();
+    if params.download_charge_videos.is_some() {
+        notify_videos_changed();
+    }
     Ok(result)
 }
 
@@ -9711,6 +10176,16 @@ pub async fn get_config() -> Result<ApiResponse<crate::api::response::ConfigResp
         submission_source_delay_seconds: config.submission_risk_control.submission_source_delay_seconds,
         enable_dynamic_api_delay: config.submission_risk_control.enable_dynamic_api_delay,
         dynamic_api_delay_multiplier: config.submission_risk_control.dynamic_api_delay_multiplier,
+        enable_large_source_download_limit: config.submission_risk_control.enable_large_source_download_limit,
+        large_source_download_threshold: config.submission_risk_control.large_source_download_threshold,
+        large_source_download_page_threshold: config.submission_risk_control.large_source_download_page_threshold,
+        large_source_max_videos_per_round: config.submission_risk_control.large_source_max_videos_per_round,
+        large_source_max_pages_per_round: config.submission_risk_control.large_source_max_pages_per_round,
+        large_source_concurrent_video: config.submission_risk_control.large_source_concurrent_video,
+        large_source_concurrent_page: config.submission_risk_control.large_source_concurrent_page,
+        large_source_playurl_limit: config.submission_risk_control.large_source_playurl_limit,
+        large_source_playurl_duration_ms: config.submission_risk_control.large_source_playurl_duration_ms,
+        audio_only_use_low_qn_for_playurl: config.submission_risk_control.audio_only_use_low_qn_for_playurl,
         // UP主投稿源扫描策略
         submission_scan_batch_size: config.submission_scan_strategy.batch_size,
         submission_adaptive_scan: config.submission_scan_strategy.adaptive_enabled,
@@ -9763,6 +10238,7 @@ pub async fn get_config() -> Result<ApiResponse<crate::api::response::ConfigResp
             webhook_custom_headers: config.notification.webhook_custom_headers.clone(),
             webhook_format: config.notification.webhook_format.clone(),
             webhook_custom_body: config.notification.webhook_custom_body.clone(),
+            webhook_synology_chat_template: config.notification.webhook_synology_chat_template.clone(),
             enable_scan_notifications: config.notification.enable_scan_notifications,
             notification_min_videos: config.notification.notification_min_videos,
             notification_timeout: config.notification.notification_timeout,
@@ -9835,12 +10311,14 @@ fn config_for_filename_preview(params: FilenamePreviewRequest) -> crate::config:
 }
 
 fn preview_time(config: &crate::config::Config) -> String {
-    chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
+    let preview_naive = chrono::NaiveDate::from_ymd_opt(2026, 5, 13)
         .and_then(|date| date.and_hms_opt(12, 34, 56))
-        .unwrap()
-        .and_utc()
-        .format(&config.time_format)
-        .to_string()
+        .unwrap();
+    crate::utils::time_format::beijing_timezone()
+        .from_local_datetime(&preview_naive)
+        .single()
+        .map(|dt| dt.format(&config.time_format).to_string())
+        .unwrap_or_else(|| preview_naive.format(&config.time_format).to_string())
 }
 
 fn preview_path(parts: &[&str]) -> String {
@@ -10290,6 +10768,16 @@ pub async fn update_config(
             auto_backoff_max_multiplier: params.auto_backoff_max_multiplier,
             source_delay_seconds: params.source_delay_seconds,
             submission_source_delay_seconds: params.submission_source_delay_seconds,
+            enable_large_source_download_limit: params.enable_large_source_download_limit,
+            large_source_download_threshold: params.large_source_download_threshold,
+            large_source_download_page_threshold: params.large_source_download_page_threshold,
+            large_source_max_videos_per_round: params.large_source_max_videos_per_round,
+            large_source_max_pages_per_round: params.large_source_max_pages_per_round,
+            large_source_concurrent_video: params.large_source_concurrent_video,
+            large_source_concurrent_page: params.large_source_concurrent_page,
+            large_source_playurl_limit: params.large_source_playurl_limit,
+            large_source_playurl_duration_ms: params.large_source_playurl_duration_ms,
+            audio_only_use_low_qn_for_playurl: params.audio_only_use_low_qn_for_playurl,
             // UP主投稿源扫描策略
             submission_scan_batch_size: params.submission_scan_batch_size,
             submission_adaptive_scan: params.submission_adaptive_scan,
@@ -10404,6 +10892,16 @@ fn config_update_field_display_name(field: &str) -> String {
         "submission_source_delay_seconds" => Some("投稿源切换延迟"),
         "enable_dynamic_api_delay" => Some("动态API延迟开关"),
         "dynamic_api_delay_multiplier" => Some("动态API延迟倍率"),
+        "enable_large_source_download_limit" => Some("大源下载保护开关"),
+        "large_source_download_threshold" => Some("大源下载保护阈值"),
+        "large_source_download_page_threshold" => Some("大源下载保护分P阈值"),
+        "large_source_max_videos_per_round" => Some("大源每轮视频上限"),
+        "large_source_max_pages_per_round" => Some("大源每轮分页上限"),
+        "large_source_concurrent_video" => Some("大源视频并发"),
+        "large_source_concurrent_page" => Some("大源分页并发"),
+        "large_source_playurl_limit" => Some("大源playurl请求限制"),
+        "large_source_playurl_duration_ms" => Some("大源playurl限制窗口"),
+        "audio_only_use_low_qn_for_playurl" => Some("音频源低清晰度取流"),
         "submission_scan_batch_size" => Some("投稿每轮扫描上限"),
         "submission_adaptive_scan" => Some("投稿自适应扫描开关"),
         "submission_adaptive_max_hours" => Some("投稿自适应最大间隔"),
@@ -11271,6 +11769,88 @@ pub async fn update_config_internal(
         }
     }
 
+    if let Some(enabled) = params.enable_large_source_download_limit {
+        if enabled != config.submission_risk_control.enable_large_source_download_limit {
+            config.submission_risk_control.enable_large_source_download_limit = enabled;
+            updated_fields.push("enable_large_source_download_limit");
+        }
+    }
+
+    if let Some(threshold) = params.large_source_download_threshold {
+        if threshold != config.submission_risk_control.large_source_download_threshold {
+            config.submission_risk_control.large_source_download_threshold = threshold;
+            updated_fields.push("large_source_download_threshold");
+        }
+    }
+
+    if let Some(threshold) = params.large_source_download_page_threshold {
+        if threshold != config.submission_risk_control.large_source_download_page_threshold {
+            config.submission_risk_control.large_source_download_page_threshold = threshold;
+            updated_fields.push("large_source_download_page_threshold");
+        }
+    }
+
+    if let Some(limit) = params.large_source_max_videos_per_round {
+        if limit != config.submission_risk_control.large_source_max_videos_per_round {
+            config.submission_risk_control.large_source_max_videos_per_round = limit;
+            updated_fields.push("large_source_max_videos_per_round");
+        }
+    }
+
+    if let Some(limit) = params.large_source_max_pages_per_round {
+        if limit != config.submission_risk_control.large_source_max_pages_per_round {
+            config.submission_risk_control.large_source_max_pages_per_round = limit;
+            updated_fields.push("large_source_max_pages_per_round");
+        }
+    }
+
+    if let Some(concurrency) = params.large_source_concurrent_video {
+        if concurrency == 0 {
+            return Err(anyhow!("大源视频并发必须大于0").into());
+        }
+        if concurrency != config.submission_risk_control.large_source_concurrent_video {
+            config.submission_risk_control.large_source_concurrent_video = concurrency;
+            updated_fields.push("large_source_concurrent_video");
+        }
+    }
+
+    if let Some(concurrency) = params.large_source_concurrent_page {
+        if concurrency == 0 {
+            return Err(anyhow!("大源分页并发必须大于0").into());
+        }
+        if concurrency != config.submission_risk_control.large_source_concurrent_page {
+            config.submission_risk_control.large_source_concurrent_page = concurrency;
+            updated_fields.push("large_source_concurrent_page");
+        }
+    }
+
+    if let Some(limit) = params.large_source_playurl_limit {
+        if limit == 0 {
+            return Err(anyhow!("大源playurl请求限制必须大于0").into());
+        }
+        if limit != config.submission_risk_control.large_source_playurl_limit {
+            config.submission_risk_control.large_source_playurl_limit = limit;
+            updated_fields.push("large_source_playurl_limit");
+        }
+    }
+
+    if let Some(duration_ms) = params.large_source_playurl_duration_ms {
+        if duration_ms == 0 {
+            return Err(anyhow!("大源playurl限制窗口必须大于0").into());
+        }
+        if duration_ms != config.submission_risk_control.large_source_playurl_duration_ms {
+            config.submission_risk_control.large_source_playurl_duration_ms = duration_ms;
+            updated_fields.push("large_source_playurl_duration_ms");
+        }
+    }
+
+    if let Some(enabled) = params.audio_only_use_low_qn_for_playurl {
+        if enabled != config.submission_risk_control.audio_only_use_low_qn_for_playurl {
+            config.submission_risk_control.audio_only_use_low_qn_for_playurl = enabled;
+            updated_fields.push("audio_only_use_low_qn_for_playurl");
+        }
+    }
+
     // UP主投稿源扫描策略
     if let Some(size) = params.submission_scan_batch_size {
         if size != config.submission_scan_strategy.batch_size {
@@ -11850,7 +12430,17 @@ pub async fn update_config_internal(
                 | "source_delay_seconds"
                 | "submission_source_delay_seconds"
                 | "enable_dynamic_api_delay"
-                | "dynamic_api_delay_multiplier" => {
+                | "dynamic_api_delay_multiplier"
+                | "enable_large_source_download_limit"
+                | "large_source_download_threshold"
+                | "large_source_download_page_threshold"
+                | "large_source_max_videos_per_round"
+                | "large_source_max_pages_per_round"
+                | "large_source_concurrent_video"
+                | "large_source_concurrent_page"
+                | "large_source_playurl_limit"
+                | "large_source_playurl_duration_ms"
+                | "audio_only_use_low_qn_for_playurl" => {
                     manager
                         .update_config_item(
                             "submission_risk_control",
@@ -18609,6 +19199,17 @@ pub async fn test_notification_handler(
             config.webhook_custom_body = Some(v.to_string());
         }
     }
+    if let Some(webhook_synology_chat_template) = request.webhook_synology_chat_template.as_ref() {
+        if webhook_synology_chat_template.trim().is_empty() {
+            config.webhook_synology_chat_template = None;
+        } else {
+            crate::utils::notification::NotificationClient::validate_synology_chat_template(
+                webhook_synology_chat_template,
+            )
+            .map_err(ApiError::from)?;
+            config.webhook_synology_chat_template = Some(webhook_synology_chat_template.to_string());
+        }
+    }
 
     // 测试推送允许在未启用通知开关时执行，但仍需要可用渠道配置
     config.enable_scan_notifications = true;
@@ -18730,6 +19331,7 @@ pub async fn get_notification_config() -> Result<ApiResponse<crate::api::respons
         webhook_custom_headers: config.webhook_custom_headers,
         webhook_format: config.webhook_format,
         webhook_custom_body: config.webhook_custom_body,
+        webhook_synology_chat_template: config.webhook_synology_chat_template,
         enable_scan_notifications: config.enable_scan_notifications,
         notification_min_videos: config.notification_min_videos,
         notification_timeout: config.notification_timeout,
@@ -18857,9 +19459,9 @@ pub async fn update_notification_config(
 
     if let Some(ref webhook_format) = request.webhook_format {
         let format = webhook_format.trim().to_ascii_lowercase();
-        if !["auto", "generic", "opensend", "custom"].contains(&format.as_str()) {
+        if !["auto", "generic", "opensend", "custom", "synology_chat"].contains(&format.as_str()) {
             return Err(ApiError::from(anyhow!(
-                "Webhook格式必须是 auto / generic / opensend / custom"
+                "Webhook格式必须是 auto / generic / opensend / custom / synology_chat"
             )));
         }
         notification_config.webhook_format = format;
@@ -18875,6 +19477,20 @@ pub async fn update_notification_config(
             )
             .map_err(ApiError::from)?;
             notification_config.webhook_custom_body = Some(webhook_custom_body.trim().to_string());
+        }
+        updated = true;
+    }
+
+    if let Some(ref webhook_synology_chat_template) = request.webhook_synology_chat_template {
+        if webhook_synology_chat_template.trim().is_empty() {
+            notification_config.webhook_synology_chat_template = None;
+        } else {
+            crate::utils::notification::NotificationClient::validate_synology_chat_template(
+                webhook_synology_chat_template,
+            )
+            .map_err(ApiError::from)?;
+            notification_config.webhook_synology_chat_template =
+                Some(webhook_synology_chat_template.to_string());
         }
         updated = true;
     }

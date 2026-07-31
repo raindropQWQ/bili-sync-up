@@ -2,6 +2,7 @@ use sea_orm::FromQueryResult;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+use crate::bilibili::FilterOption;
 use crate::utils::status::{PageStatus, VideoStatus};
 
 #[derive(Debug, Serialize, ToSchema, Default)]
@@ -164,8 +165,11 @@ pub struct UpdateVideoSourceDownloadOptionsResponse {
     pub audio_only_m4a_only: bool,
     pub flat_folder: bool,
     pub split_chapters_after_download: bool,
+    pub download_charge_videos: bool,
     pub download_danmaku: bool,
     pub download_subtitle: bool,
+    pub download_ai_subtitle: bool,
+    pub ai_subtitle_language: String,
     pub ai_rename: bool,
     pub ai_rename_video_prompt: String,
     pub ai_rename_audio_prompt: String,
@@ -174,6 +178,7 @@ pub struct UpdateVideoSourceDownloadOptionsResponse {
     pub ai_rename_enable_bangumi: bool,
     pub ai_rename_rename_parent_dir: bool,
     pub use_dynamic_api: bool,
+    pub filter_option: Option<FilterOption>,
     pub message: String,
 }
 
@@ -266,8 +271,11 @@ pub struct VideoSource {
     pub audio_only_m4a_only: bool,           // 仅音频时只保留m4a（不下载封面/nfo/弹幕/字幕）
     pub flat_folder: bool,                   // 是否启用平铺目录模式
     pub split_chapters_after_download: bool, // 是否在下载后按播放器章节切分为独立视频
+    pub download_charge_videos: bool,        // 是否下载充电专享视频
     pub download_danmaku: bool,              // 是否下载弹幕文件
     pub download_subtitle: bool,             // 是否下载字幕文件
+    pub download_ai_subtitle: bool,          // 是否下载 B 站 AI 字幕
+    pub ai_subtitle_language: String,        // AI 字幕语言，默认 zh-CN
     pub ai_rename: bool,                     // 是否启用AI重命名
     pub ai_rename_video_prompt: String,      // AI重命名视频提示词
     pub ai_rename_audio_prompt: String,      // AI重命名音频提示词
@@ -275,6 +283,8 @@ pub struct VideoSource {
     pub ai_rename_enable_collection: bool,   // 对合集视频启用AI重命名
     pub ai_rename_enable_bangumi: bool,      // 对番剧启用AI重命名
     pub ai_rename_rename_parent_dir: bool,   // AI重命名时重命名上级目录
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filter_option: Option<FilterOption>, // 视频源级流过滤配置，None 表示继承全局
     #[serde(skip_serializing_if = "Option::is_none")]
     pub use_dynamic_api: Option<bool>, // 投稿源：是否使用动态API
 }
@@ -532,6 +542,16 @@ pub struct ConfigResponse {
     pub submission_source_delay_seconds: u64,
     pub enable_dynamic_api_delay: bool,
     pub dynamic_api_delay_multiplier: f64,
+    pub enable_large_source_download_limit: bool,
+    pub large_source_download_threshold: usize,
+    pub large_source_download_page_threshold: usize,
+    pub large_source_max_videos_per_round: usize,
+    pub large_source_max_pages_per_round: usize,
+    pub large_source_concurrent_video: usize,
+    pub large_source_concurrent_page: usize,
+    pub large_source_playurl_limit: usize,
+    pub large_source_playurl_duration_ms: u64,
+    pub audio_only_use_low_qn_for_playurl: bool,
     // UP主投稿源扫描策略
     pub submission_scan_batch_size: usize,
     pub submission_adaptive_scan: bool,
@@ -1031,6 +1051,7 @@ pub struct NotificationConfigResponse {
     pub webhook_custom_headers: Option<String>,
     pub webhook_format: String,
     pub webhook_custom_body: Option<String>,
+    pub webhook_synology_chat_template: Option<String>,
     pub enable_scan_notifications: bool,
     pub notification_min_videos: usize,
     pub notification_timeout: u64,

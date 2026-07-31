@@ -7,13 +7,7 @@ export interface ApiResponse<T> {
 
 // 排序字段枚举
 export type SortBy =
-	| 'id'
-	| 'name'
-	| 'upper_name'
-	| 'created_at'
-	| 'pubtime'
-	| 'is_charge_video'
-	| 'file_size';
+	'id' | 'name' | 'upper_name' | 'created_at' | 'pubtime' | 'is_charge_video' | 'file_size';
 
 // 排序顺序枚举
 export type SortOrder = 'asc' | 'desc';
@@ -38,6 +32,41 @@ export interface VideosRequest {
 // 关键词过滤模式类型
 export type KeywordFilterMode = 'blacklist' | 'whitelist';
 
+// 视频/音频流过滤配置
+export type VideoQuality =
+	| 'Quality360p'
+	| 'Quality480p'
+	| 'Quality720p'
+	| 'Quality1080p'
+	| 'Quality1080pPLUS'
+	| 'Quality1080p60'
+	| 'Quality4k'
+	| 'QualityHdr'
+	| 'QualityDolby'
+	| 'Quality8k';
+
+export type AudioQuality =
+	| 'Quality64k'
+	| 'Quality132k'
+	| 'QualityDolby'
+	| 'QualityHiRES'
+	| 'QualityDolbyBangumi'
+	| 'Quality192k';
+
+export type VideoCodec = 'AVC' | 'HEV' | 'AV1';
+
+export interface FilterOption {
+	video_max_quality: VideoQuality;
+	video_min_quality: VideoQuality;
+	audio_max_quality: AudioQuality;
+	audio_min_quality: AudioQuality;
+	codecs: VideoCodec[];
+	no_dolby_video: boolean;
+	no_dolby_audio: boolean;
+	no_hdr: boolean;
+	no_hires: boolean;
+}
+
 // 视频来源类型
 export interface VideoSource {
 	id: number;
@@ -60,6 +89,7 @@ export interface VideoSource {
 	selected_seasons?: string[];
 	selected_videos?: string | null; // 投稿源：选中视频（JSON字符串）
 	use_dynamic_api?: boolean; // 投稿源：是否使用动态API
+	filter_option?: FilterOption | null; // 视频源级流过滤配置，空表示继承全局
 	// 新的双列表模式关键词过滤
 	blacklist_keywords?: string[]; // 黑名单关键词列表（匹配的视频将被排除）
 	whitelist_keywords?: string[]; // 白名单关键词列表（只下载匹配的视频）
@@ -76,8 +106,11 @@ export interface VideoSource {
 	audio_only_m4a_only: boolean; // 仅音频时只保留m4a（不下载封面/nfo/弹幕/字幕）
 	flat_folder: boolean; // 平铺目录模式（不为每个视频创建子文件夹）
 	split_chapters_after_download: boolean; // 下载后按播放器章节切分为独立视频
+	download_charge_videos: boolean; // 是否下载充电视频
 	download_danmaku: boolean; // 是否下载弹幕
 	download_subtitle: boolean; // 是否下载字幕
+	download_ai_subtitle: boolean; // 是否下载 B 站 AI 字幕
+	ai_subtitle_language: string; // AI 字幕优先语言
 	ai_rename: boolean; // 是否启用AI重命名
 	ai_rename_video_prompt: string; // AI重命名视频提示词
 	ai_rename_audio_prompt: string; // AI重命名音频提示词
@@ -245,13 +278,17 @@ export interface AddVideoSourceRequest {
 	merge_to_source_id?: number;
 	keyword_filters?: string[]; // 关键词过滤器列表（支持正则表达式）
 	keyword_filter_mode?: KeywordFilterMode; // 关键词过滤模式: "blacklist"（排除匹配）或 "whitelist"（只下载匹配）
+	filter_option?: FilterOption | null; // 视频源级流过滤配置，空表示继承全局
 	// 下载选项
 	audio_only?: boolean; // 仅下载音频（输出m4a格式）
 	audio_only_m4a_only?: boolean; // 仅音频时只保留m4a（不下载封面/nfo/弹幕/字幕）
 	flat_folder?: boolean; // 平铺目录模式（不为每个视频创建子文件夹）
 	split_chapters_after_download?: boolean; // 下载后按播放器章节切分为独立视频
+	download_charge_videos?: boolean; // 是否下载充电视频（默认true）
 	download_danmaku?: boolean; // 是否下载弹幕（默认true）
 	download_subtitle?: boolean; // 是否下载字幕（默认true）
+	download_ai_subtitle?: boolean; // 是否下载 B 站 AI 字幕（默认true）
+	ai_subtitle_language?: string; // AI 字幕优先语言（默认 zh-CN）
 	use_dynamic_api?: boolean; // 投稿源：是否使用动态API
 	ai_rename?: boolean; // 是否启用AI重命名（默认false）
 	ai_rename_video_prompt?: string; // AI重命名视频提示词
@@ -356,6 +393,16 @@ export interface ConfigResponse {
 	submission_source_delay_seconds?: number;
 	enable_dynamic_api_delay?: boolean;
 	dynamic_api_delay_multiplier?: number;
+	enable_large_source_download_limit?: boolean;
+	large_source_download_threshold?: number;
+	large_source_download_page_threshold?: number;
+	large_source_max_videos_per_round?: number;
+	large_source_max_pages_per_round?: number;
+	large_source_concurrent_video?: number;
+	large_source_concurrent_page?: number;
+	large_source_playurl_limit?: number;
+	large_source_playurl_duration_ms?: number;
+	audio_only_use_low_qn_for_playurl?: boolean;
 	// UP主投稿源扫描策略
 	submission_scan_batch_size?: number;
 	submission_adaptive_scan?: boolean;
@@ -529,6 +576,16 @@ export interface UpdateConfigRequest {
 	submission_source_delay_seconds?: number;
 	enable_dynamic_api_delay?: boolean;
 	dynamic_api_delay_multiplier?: number;
+	enable_large_source_download_limit?: boolean;
+	large_source_download_threshold?: number;
+	large_source_download_page_threshold?: number;
+	large_source_max_videos_per_round?: number;
+	large_source_max_pages_per_round?: number;
+	large_source_concurrent_video?: number;
+	large_source_concurrent_page?: number;
+	large_source_playurl_limit?: number;
+	large_source_playurl_duration_ms?: number;
+	audio_only_use_low_qn_for_playurl?: boolean;
 	// UP主投稿源扫描策略
 	submission_scan_batch_size?: number;
 	submission_adaptive_scan?: boolean;

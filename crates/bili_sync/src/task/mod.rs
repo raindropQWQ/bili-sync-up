@@ -49,6 +49,10 @@ pub struct AddVideoSourceTask {
     pub up_id: Option<String>,
     pub collection_type: Option<String>,
     pub collection_aggregate_enabled: Option<bool>,
+    #[serde(default)]
+    pub filter_option: Option<crate::bilibili::FilterOption>,
+    #[serde(default)]
+    pub download_charge_videos: Option<bool>,
     pub media_id: Option<String>,
     pub ep_id: Option<String>,
     pub download_all_seasons: Option<bool>,
@@ -127,6 +131,16 @@ pub struct UpdateConfigTask {
     pub auto_backoff_max_multiplier: Option<u64>,
     pub source_delay_seconds: Option<u64>,
     pub submission_source_delay_seconds: Option<u64>,
+    pub enable_large_source_download_limit: Option<bool>,
+    pub large_source_download_threshold: Option<usize>,
+    pub large_source_download_page_threshold: Option<usize>,
+    pub large_source_max_videos_per_round: Option<usize>,
+    pub large_source_max_pages_per_round: Option<usize>,
+    pub large_source_concurrent_video: Option<usize>,
+    pub large_source_concurrent_page: Option<usize>,
+    pub large_source_playurl_limit: Option<usize>,
+    pub large_source_playurl_duration_ms: Option<u64>,
+    pub audio_only_use_low_qn_for_playurl: Option<bool>,
     // UP主投稿源扫描策略
     pub submission_scan_batch_size: Option<usize>,
     pub submission_adaptive_scan: Option<bool>,
@@ -1847,6 +1861,8 @@ impl AddTaskQueue {
                 up_id: task.up_id.clone(),
                 collection_type: task.collection_type.clone(),
                 collection_aggregate_enabled: task.collection_aggregate_enabled,
+                filter_option: task.filter_option.clone(),
+                download_charge_videos: task.download_charge_videos,
                 media_id: task.media_id.clone(),
                 ep_id: task.ep_id.clone(),
                 download_all_seasons: task.download_all_seasons,
@@ -1859,6 +1875,8 @@ impl AddTaskQueue {
                 audio_only: None,                    // 任务队列中使用默认值
                 download_danmaku: None,              // 任务队列中使用默认值
                 download_subtitle: None,             // 任务队列中使用默认值
+                download_ai_subtitle: None,          // 任务队列中使用默认值
+                ai_subtitle_language: None,          // 任务队列中使用默认值
                 ai_rename: None,                     // 任务队列中使用默认值
                 ai_rename_video_prompt: None,        // 任务队列中使用默认值
                 ai_rename_audio_prompt: None,        // 任务队列中使用默认值
@@ -2394,6 +2412,16 @@ impl ConfigTaskQueue {
                 submission_source_delay_seconds: task.submission_source_delay_seconds,
                 enable_dynamic_api_delay: None,
                 dynamic_api_delay_multiplier: None,
+                enable_large_source_download_limit: task.enable_large_source_download_limit,
+                large_source_download_threshold: task.large_source_download_threshold,
+                large_source_download_page_threshold: task.large_source_download_page_threshold,
+                large_source_max_videos_per_round: task.large_source_max_videos_per_round,
+                large_source_max_pages_per_round: task.large_source_max_pages_per_round,
+                large_source_concurrent_video: task.large_source_concurrent_video,
+                large_source_concurrent_page: task.large_source_concurrent_page,
+                large_source_playurl_limit: task.large_source_playurl_limit,
+                large_source_playurl_duration_ms: task.large_source_playurl_duration_ms,
+                audio_only_use_low_qn_for_playurl: task.audio_only_use_low_qn_for_playurl,
                 submission_scan_batch_size: task.submission_scan_batch_size,
                 submission_adaptive_scan: task.submission_adaptive_scan,
                 submission_adaptive_max_hours: task.submission_adaptive_max_hours,

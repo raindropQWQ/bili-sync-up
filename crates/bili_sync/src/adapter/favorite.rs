@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::pin::Pin;
 
-use crate::utils::time_format::now_standard_string;
+use crate::utils::time_format::{now_standard_string, parse_time_string};
 use anyhow::{Context, Result};
 use bili_sync_entity::*;
 use chrono::Utc;
@@ -58,9 +58,10 @@ impl VideoSource for favorite::Model {
         }
 
         let beijing_tz = crate::utils::time_format::beijing_timezone();
-        let release_beijing = release_datetime.with_timezone(&beijing_tz);
-        let release_beijing_str = release_beijing.format("%Y-%m-%d %H:%M:%S").to_string();
-        release_beijing_str.as_str() > latest_row_at_string
+        let release_beijing = release_datetime.with_timezone(&beijing_tz).naive_local();
+        let latest_row_at =
+            parse_time_string(latest_row_at_string).unwrap_or_else(crate::utils::time_format::beijing_epoch_naive);
+        release_beijing > latest_row_at
     }
 
     fn log_refresh_video_start(&self) {
@@ -139,6 +140,10 @@ impl VideoSource for favorite::Model {
         self.published_before.clone()
     }
 
+    fn filter_option(&self) -> Option<&serde_json::Value> {
+        self.filter_option.as_ref()
+    }
+
     fn audio_only(&self) -> bool {
         self.audio_only
     }
@@ -155,12 +160,24 @@ impl VideoSource for favorite::Model {
         self.split_chapters_after_download
     }
 
+    fn download_charge_videos(&self) -> bool {
+        self.download_charge_videos
+    }
+
     fn download_danmaku(&self) -> bool {
         self.download_danmaku
     }
 
     fn download_subtitle(&self) -> bool {
         self.download_subtitle
+    }
+
+    fn download_ai_subtitle(&self) -> bool {
+        self.download_ai_subtitle
+    }
+
+    fn ai_subtitle_language(&self) -> &str {
+        &self.ai_subtitle_language
     }
 
     fn ai_rename(&self) -> bool {

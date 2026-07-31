@@ -141,6 +141,10 @@ impl VideoSource for collection::Model {
         self.published_before.clone()
     }
 
+    fn filter_option(&self) -> Option<&serde_json::Value> {
+        self.filter_option.as_ref()
+    }
+
     fn audio_only(&self) -> bool {
         self.audio_only
     }
@@ -157,12 +161,24 @@ impl VideoSource for collection::Model {
         self.split_chapters_after_download
     }
 
+    fn download_charge_videos(&self) -> bool {
+        self.download_charge_videos
+    }
+
     fn download_danmaku(&self) -> bool {
         self.download_danmaku
     }
 
     fn download_subtitle(&self) -> bool {
         self.download_subtitle
+    }
+
+    fn download_ai_subtitle(&self) -> bool {
+        self.download_ai_subtitle
+    }
+
+    fn ai_subtitle_language(&self) -> &str {
+        &self.ai_subtitle_language
     }
 
     fn ai_rename(&self) -> bool {
