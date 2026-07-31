@@ -66,9 +66,10 @@ pub trait VideoSource {
     // 判断是否应该继续拉取视频
     fn should_take(&self, release_datetime: &chrono::DateTime<Utc>, latest_row_at_string: &str) -> bool {
         let beijing_tz = crate::utils::time_format::beijing_timezone();
-        let release_beijing = release_datetime.with_timezone(&beijing_tz);
-        let release_beijing_str = release_beijing.format("%Y-%m-%d %H:%M:%S").to_string();
-        release_beijing_str.as_str() > latest_row_at_string
+        let release_beijing = release_datetime.with_timezone(&beijing_tz).naive_local();
+        let latest_row_at = crate::utils::time_format::parse_time_string(latest_row_at_string)
+            .unwrap_or_else(crate::utils::time_format::beijing_epoch_naive);
+        release_beijing > latest_row_at
     }
 
     /// 是否允许跳过第一条旧视频并继续扫描（用于动态API置顶旧视频场景）
@@ -104,7 +105,7 @@ pub trait VideoSource {
     }
 
     /// 获取创建时间，用于判断是否为新投稿
-    fn get_created_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+    fn get_created_at(&self) -> Option<chrono::NaiveDateTime> {
         None // 默认实现：没有创建时间信息
     }
 
@@ -159,6 +160,11 @@ pub trait VideoSource {
         None
     }
 
+    /// 获取视频源级流过滤配置；None 表示继承全局配置
+    fn filter_option(&self) -> Option<&serde_json::Value> {
+        None
+    }
+
     /// 获取是否仅下载音频（默认为 false）
     fn audio_only(&self) -> bool {
         false // 默认实现：下载视频
@@ -182,6 +188,11 @@ pub trait VideoSource {
         false
     }
 
+    /// 是否下载充电专享视频（默认为 true，保持历史行为）
+    fn download_charge_videos(&self) -> bool {
+        true
+    }
+
     /// 获取是否下载弹幕（默认为 true）
     fn download_danmaku(&self) -> bool {
         true // 默认实现：下载弹幕
@@ -190,6 +201,16 @@ pub trait VideoSource {
     /// 获取是否下载字幕（默认为 true）
     fn download_subtitle(&self) -> bool {
         true // 默认实现：下载字幕
+    }
+
+    /// 获取是否下载 B 站 AI 字幕（默认为 true）
+    fn download_ai_subtitle(&self) -> bool {
+        true
+    }
+
+    /// 获取 AI 字幕语言（默认为中文）
+    fn ai_subtitle_language(&self) -> &str {
+        "zh-CN"
     }
 
     /// 获取是否启用AI重命名（默认为 false）
@@ -507,12 +528,16 @@ pub async fn bangumi_from<'a>(
             max_duration_seconds: model.max_duration_seconds,
             published_after: model.published_after,
             published_before: model.published_before,
+            filter_option: model.filter_option,
             audio_only: model.audio_only,
             audio_only_m4a_only: model.audio_only_m4a_only,
             flat_folder: model.flat_folder,
             split_chapters_after_download: model.split_chapters_after_download,
+            download_charge_videos: model.download_charge_videos,
             download_danmaku: model.download_danmaku,
             download_subtitle: model.download_subtitle,
+            download_ai_subtitle: model.download_ai_subtitle,
+            ai_subtitle_language: model.ai_subtitle_language,
             ai_rename: model.ai_rename,
             ai_rename_video_prompt: model.ai_rename_video_prompt,
             ai_rename_audio_prompt: model.ai_rename_audio_prompt,
@@ -553,12 +578,16 @@ pub async fn bangumi_from<'a>(
             max_duration_seconds: None,
             published_after: None,
             published_before: None,
+            filter_option: None,
             audio_only: false,
             audio_only_m4a_only: false,
             flat_folder: false,
             split_chapters_after_download: false,
+            download_charge_videos: true,
             download_danmaku: true,
             download_subtitle: true,
+            download_ai_subtitle: true,
+            ai_subtitle_language: "zh-CN".to_string(),
             ai_rename: false,
             ai_rename_video_prompt: String::new(),
             ai_rename_audio_prompt: String::new(),

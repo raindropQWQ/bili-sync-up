@@ -90,6 +90,8 @@ struct GenericWebhookRequest {
     sent_at: String,
 }
 
+const DEFAULT_SYNOLOGY_CHAT_TEMPLATE: &str = ":loudspeaker: ------{{title}}------ :loudspeaker:\n{{content}}";
+
 // 推送通知客户端
 pub struct NotificationClient {
     client: Client,
@@ -406,7 +408,8 @@ impl NotificationClient {
 
         let webhook_format = Self::resolve_webhook_format(self.config.webhook_format.as_str(), url);
         let is_open_send = webhook_format == "opensend";
-        let headers = self.build_webhook_headers(is_open_send)?;
+        let is_synology_chat = webhook_format == "synology_chat";
+        let headers = self.build_webhook_headers(is_open_send, is_synology_chat)?;
         let req = self.client.post(url).headers(headers);
 
         let resp = if is_open_send {
@@ -427,7 +430,17 @@ impl NotificationClient {
                 .filter(|v| !v.trim().is_empty())
                 .ok_or_else(|| anyhow!("未配置自定义 POST Body"))?;
             let rendered = Self::render_custom_webhook_body(custom_body, &payload)?;
-            req.json(&rendered).send().await?
+            req.body(rendered).send().await?
+        } else if is_synology_chat {
+            // Synology Chat 的 Incoming Webhook 不是 JSON API：它要求
+            // application/x-www-form-urlencoded，且 JSON 必须作为 payload 字段的值。
+            // 这里先序列化内层对象，再让 reqwest 对整个表单字段做一次 URL 编码，
+            // 不能把 JSON 字符串再包进一个 JSON 对象，否则群晖会静默丢弃消息。
+            let synology_payload = serde_json::to_string(&serde_json::json!({
+                "text": self.render_synology_chat_text(&payload),
+                "username": "bili-sync"
+            }))?;
+            req.form(&[("payload", synology_payload)]).send().await?
         } else {
             req.json(&payload).send().await?
         };
@@ -456,6 +469,7 @@ impl NotificationClient {
             "generic" => "generic",
             "opensend" => "opensend",
             "custom" => "custom",
+            "synology_chat" => "synology_chat",
             _ => {
                 if Self::is_open_send_webhook(url) {
                     "opensend"
@@ -480,7 +494,7 @@ impl NotificationClient {
                 .is_none_or(|value| value.trim().is_empty())
         {
             debug!(
-                "Webhook渠道使用自定义 JSON 但未配置 POST Body，跳过{}",
+                "Webhook渠道使用自定义请求 但未配置 POST Body，跳过{}",
                 notification_name
             );
             return None;
@@ -489,9 +503,14 @@ impl NotificationClient {
         Some(webhook_url)
     }
 
-    fn build_webhook_headers(&self, is_open_send: bool) -> Result<HeaderMap> {
+    fn build_webhook_headers(&self, is_open_send: bool, is_synology_chat: bool) -> Result<HeaderMap> {
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let content_type = if is_synology_chat {
+            HeaderValue::from_static("application/x-www-form-urlencoded")
+        } else {
+            HeaderValue::from_static("application/json")
+        };
+        headers.insert(CONTENT_TYPE, content_type.clone());
 
         if let Some(token) = self
             .config
@@ -516,6 +535,11 @@ impl NotificationClient {
             for (name, value) in Self::parse_custom_webhook_headers(custom_headers)? {
                 headers.insert(name, value);
             }
+        }
+
+        // Synology Chat 只接受表单；不允许自定义 Headers 把它改回 JSON。
+        if is_synology_chat {
+            headers.insert(CONTENT_TYPE, content_type);
         }
 
         Ok(headers)
@@ -673,14 +697,115 @@ impl NotificationClient {
         map
     }
 
-    fn render_custom_webhook_body(template: &str, payload: &GenericWebhookRequest) -> Result<serde_json::Value> {
-        let parsed: serde_json::Value =
-            serde_json::from_str(template).map_err(|e| anyhow!("自定义 POST Body 不是有效 JSON: {}", e))?;
+    fn render_custom_webhook_body(template: &str, payload: &GenericWebhookRequest) -> Result<String> {
         let context = Self::build_custom_webhook_context(payload);
-        Ok(Self::apply_template_placeholders(parsed, &context))
+        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(template) {
+            let rendered = Self::apply_template_placeholders(parsed, &context);
+            return serde_json::to_string(&rendered).map_err(Into::into);
+        }
+
+        Ok(Self::apply_raw_webhook_template(template, &context))
+    }
+
+    fn apply_raw_webhook_template(template: &str, context: &serde_json::Map<String, serde_json::Value>) -> String {
+        let mut rendered = template.to_string();
+        for (key, value) in context {
+            let text = Self::placeholder_scalar_text(value);
+            let json_placeholder = format!("{{{{{}_json}}}}", key);
+            let form_placeholder = format!("{{{{{}_urlencoded}}}}", key);
+            let placeholder = format!("{{{{{}}}}}", key);
+            let json_text = serde_json::to_string(&text).unwrap_or_default();
+            rendered = rendered.replace(&json_placeholder, &json_text);
+            rendered = rendered.replace(&form_placeholder, &Self::form_urlencode(&text));
+            rendered = rendered.replace(&placeholder, &text);
+        }
+        rendered
+    }
+
+    fn form_urlencode(value: &str) -> String {
+        let mut encoded = String::with_capacity(value.len());
+        for byte in value.bytes() {
+            match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'*' => encoded.push(byte as char),
+                b' ' => encoded.push('+'),
+                _ => {
+                    use std::fmt::Write;
+                    let _ = write!(encoded, "%{byte:02X}");
+                }
+            }
+        }
+        encoded
+    }
+
+    fn render_synology_chat_text(&self, payload: &GenericWebhookRequest) -> String {
+        let template = self
+            .config
+            .webhook_synology_chat_template
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or(DEFAULT_SYNOLOGY_CHAT_TEMPLATE);
+        let mut context = Self::build_custom_webhook_context(payload);
+        context.insert(
+            "content".to_string(),
+            serde_json::Value::String(Self::plain_text_for_synology_chat(&payload.content)),
+        );
+
+        let mut rendered = template.to_string();
+        for (key, value) in context {
+            let placeholder = format!("{{{{{}}}}}", key);
+            rendered = rendered.replace(&placeholder, &Self::placeholder_scalar_text(&value));
+        }
+        rendered
+    }
+
+    fn plain_text_for_synology_chat(content: &str) -> String {
+        content
+            .lines()
+            .map(|line| {
+                let trimmed = line.trim_start();
+                let plain = if let Some(item) = trimmed.strip_prefix("- ") {
+                    format!("• {}", item)
+                } else {
+                    let heading = trimmed.trim_start_matches('#');
+                    if heading.len() != trimmed.len() && heading.chars().next().is_some_and(char::is_whitespace) {
+                        heading.trim_start().to_string()
+                    } else {
+                        line.to_string()
+                    }
+                };
+                plain.replace("**", "").replace('`', "")
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn validate_synology_chat_template(template: &str) -> Result<()> {
+        if template.trim().is_empty() {
+            return Err(anyhow!("Synology Chat 消息模板不能为空"));
+        }
+
+        let sample_payload = GenericWebhookRequest {
+            source: "bili-sync".to_string(),
+            title: "Bili Sync 测试推送".to_string(),
+            content: "这是一条Webhook测试推送消息。".to_string(),
+            channel: "webhook".to_string(),
+            event: "test_notification".to_string(),
+            sent_at: chrono::Local::now().to_rfc3339(),
+        };
+        let mut config = NotificationConfig::default();
+        config.webhook_synology_chat_template = Some(template.to_string());
+        let client = Self::new(config);
+        let rendered = client.render_synology_chat_text(&sample_payload);
+        if rendered.trim().is_empty() {
+            return Err(anyhow!("Synology Chat 消息模板渲染后不能为空"));
+        }
+        Ok(())
     }
 
     pub fn validate_custom_webhook_body_template(template: &str) -> Result<()> {
+        if template.trim().is_empty() {
+            return Err(anyhow!("自定义 POST Body 不能为空"));
+        }
         let sample_payload = GenericWebhookRequest {
             source: "bili-sync".to_string(),
             title: "Bili Sync 测试推送".to_string(),
@@ -927,7 +1052,7 @@ impl NotificationClient {
                         .as_ref()
                         .is_none_or(|value| value.trim().is_empty())
                 {
-                    return Err(anyhow!("Webhook渠道已选择自定义 JSON 但未配置 POST Body"));
+                    return Err(anyhow!("Webhook渠道已选择自定义请求 但未配置 POST Body"));
                 }
 
                 let title = "Bili Sync 测试推送";
@@ -989,7 +1114,7 @@ impl NotificationClient {
                         .as_ref()
                         .is_none_or(|value| value.trim().is_empty())
                 {
-                    return Err(anyhow!("Webhook渠道已选择自定义 JSON 但未配置 POST Body"));
+                    return Err(anyhow!("Webhook渠道已选择自定义请求 但未配置 POST Body"));
                 }
                 self.send_to_webhook(webhook_url, title, &content, "custom_test_notification")
                     .await?;
@@ -1321,13 +1446,14 @@ pub async fn send_deepseek_token_expired_notification() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::extract::State;
+    use axum::extract::{Form, State};
     use axum::http::HeaderMap as AxumHeaderMap;
     use axum::response::IntoResponse;
     use axum::routing::post;
     use axum::Json;
     use axum::Router;
     use serde_json::json;
+    use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::net::TcpListener;
     use tokio::sync::Mutex;
@@ -1416,6 +1542,48 @@ mod tests {
         assert!(NotificationClient::validate_custom_webhook_headers(r#"{"Bad Header":"value"}"#).is_err());
     }
 
+    #[test]
+    fn test_custom_webhook_body_allows_raw_templates() {
+        let payload = GenericWebhookRequest {
+            source: "bili-sync".to_string(),
+            title: "测试标题".to_string(),
+            content: "测试正文".to_string(),
+            channel: "webhook".to_string(),
+            event: "test_notification".to_string(),
+            sent_at: "2026-07-28T00:00:00+08:00".to_string(),
+        };
+
+        assert!(
+            NotificationClient::validate_custom_webhook_body_template("payload={{title}}&message={{content}}").is_ok()
+        );
+        assert_eq!(
+            NotificationClient::render_custom_webhook_body(
+                "payload={{title_urlencoded}}&message={{content_urlencoded}}&json={{content_json}}",
+                &payload,
+            )
+            .expect("raw template should render"),
+            "payload=%E6%B5%8B%E8%AF%95%E6%A0%87%E9%A2%98&message=%E6%B5%8B%E8%AF%95%E6%AD%A3%E6%96%87&json=\"测试正文\""
+        );
+    }
+
+    #[test]
+    fn test_synology_chat_default_template_uses_plain_text() {
+        let client = NotificationClient::new(NotificationConfig::default());
+        let payload = GenericWebhookRequest {
+            source: "bili-sync".to_string(),
+            title: "扫描完成".to_string(),
+            content: "📊 **扫描摘要**\n- 新增视频: 1个".to_string(),
+            channel: "webhook".to_string(),
+            event: "scan_completion".to_string(),
+            sent_at: "2026-07-28T00:00:00+08:00".to_string(),
+        };
+
+        assert_eq!(
+            client.render_synology_chat_text(&payload),
+            ":loudspeaker: ------扫描完成------ :loudspeaker:\n📊 扫描摘要\n• 新增视频: 1个"
+        );
+    }
+
     #[derive(Debug, Clone)]
     struct CapturedWebhookRequest {
         authorization: Option<String>,
@@ -1457,6 +1625,44 @@ mod tests {
         let captured = Arc::new(Mutex::new(None));
         let app = Router::new()
             .route(route_path, post(capture_webhook_request))
+            .with_state(captured.clone());
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok((format!("http://{}{}", addr, route_path), captured))
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturedSynologyChatRequest {
+        content_type: Option<String>,
+        payload: Option<String>,
+    }
+
+    async fn capture_synology_chat_request(
+        State(captured): State<Arc<Mutex<Option<CapturedSynologyChatRequest>>>>,
+        headers: AxumHeaderMap,
+        Form(form): Form<HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        *captured.lock().await = Some(CapturedSynologyChatRequest {
+            content_type: headers
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            payload: form.get("payload").cloned(),
+        });
+        Json(json!({ "success": true }))
+    }
+
+    async fn spawn_synology_chat_capture_server(
+        route_path: &str,
+    ) -> Result<(String, Arc<Mutex<Option<CapturedSynologyChatRequest>>>)> {
+        let captured = Arc::new(Mutex::new(None));
+        let app = Router::new()
+            .route(route_path, post(capture_synology_chat_request))
             .with_state(captured.clone());
 
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -1542,6 +1748,54 @@ mod tests {
         );
         assert_eq!(request.body.get("proxy").and_then(|v| v.as_bool()), Some(false));
         assert!(request.body.get("imageUrl").is_some());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_send_to_synology_chat_uses_form_payload() {
+        let (url, captured) = spawn_synology_chat_capture_server("/webhook")
+            .await
+            .expect("start Synology Chat capture server");
+
+        let mut config = NotificationConfig::default();
+        config.active_channel = "webhook".to_string();
+        config.webhook_url = Some(url);
+        config.webhook_format = "synology_chat".to_string();
+        config.webhook_custom_headers = Some(r#"{"Content-Type":"application/json"}"#.to_string());
+        config.webhook_synology_chat_template =
+            Some(":loudspeaker: {{title}}\n:mailbox_closed: {{content}}\n{{event}}".to_string());
+
+        let client = NotificationClient::new(config);
+        client
+            .send_to_webhook(
+                client.config.webhook_url.as_deref().unwrap(),
+                "群晖标题",
+                "**群晖正文**\n- 第二项",
+                "test_notification",
+            )
+            .await
+            .expect("send Synology Chat webhook");
+
+        let request = captured
+            .lock()
+            .await
+            .clone()
+            .expect("captured Synology Chat webhook request");
+        assert_eq!(
+            request.content_type.as_deref(),
+            Some("application/x-www-form-urlencoded")
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(request.payload.as_deref().expect("form must contain payload"))
+                .expect("payload must be a JSON object, not an escaped JSON string");
+        assert_eq!(
+            payload.get("username").and_then(|value| value.as_str()),
+            Some("bili-sync")
+        );
+        assert_eq!(
+            payload.get("text").and_then(|value| value.as_str()),
+            Some(":loudspeaker: 群晖标题\n:mailbox_closed: 群晖正文\n• 第二项\ntest_notification")
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
